@@ -164,54 +164,55 @@ weights = {"pbo": weight_pbo, "avg_daily_pnl": weight_avg_pnl,
 
 
 # ── Compute all 4 modes' grids + composite tables ───────────────────────────────
+# Each cached_* call below is individually cached (grid_cache.py) and already
+# carries its own spinner text — deliberately NOT wrapped in one outer cached
+# function (that would hide all 8 grid/PBO computations behind a single
+# opaque, silent call). Instead a visible status block updates step by step,
+# so a slow run (PBO especially) shows *which* of the 4 modes it's on rather
+# than going blank for however long the whole thing takes.
 
-@st.cache_data(show_spinner=False)
-def _all_composites(profile, lookbacks, buckets, method, exclusion_rule, n_exclude,
-                     iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
-                     iv_lookbacks, iv_buckets, iv_method, iv_exclusion_rule, iv_n_exclude,
-                     min_days_per_bucket, cscv_metric, cscv_max_S, cscv_min_partition, weights):
-    cfg = load_static_config(profile)
-    tables = {}
-
+composite_tables = {}
+with st.status("Computing all 4 mode leaderboards…", expanded=True) as status:
+    st.write("HARCJ only — grid…")
     grid = cached_grid(profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
                         int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket))
+    st.write("HARCJ only — PBO grid (this is usually the slow part)…")
     pbo = cached_pbo_grid(profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
                            int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket),
                            cscv_metric, int(cscv_max_S), int(cscv_min_partition))
-    tables["harcj_only"] = dt.composite_score_table(grid, pbo, weights)
+    composite_tables["harcj_only"] = dt.composite_score_table(grid, pbo, weights)
+    st.write("✓ HARCJ only done (1/4)")
 
+    st.write("IV only — grid…")
     grid = cached_iv_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                            tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
                            int(iv_n_exclude), int(min_days_per_bucket))
+    st.write("IV only — PBO grid…")
     pbo = cached_iv_pbo_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                               tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
                               int(iv_n_exclude), int(min_days_per_bucket),
                               cscv_metric, int(cscv_max_S), int(cscv_min_partition))
-    tables["iv_only"] = dt.composite_score_table(grid, pbo, weights)
+    composite_tables["iv_only"] = dt.composite_score_table(grid, pbo, weights)
+    st.write("✓ IV only done (2/4)")
 
-    for mode in ("and_both", "or_either"):
+    for i, mode in enumerate(("and_both", "or_either"), start=3):
+        st.write(f"{MODE_LABELS[mode]} — paired grid…")
         grid = cached_paired_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                                    tuple(lookbacks), tuple(buckets),
                                    method, exclusion_rule, int(n_exclude),
                                    iv_method, iv_exclusion_rule, int(iv_n_exclude),
                                    mode, int(min_days_per_bucket))
+        st.write(f"{MODE_LABELS[mode]} — paired PBO grid…")
         pbo = cached_paired_pbo_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                                       tuple(lookbacks), tuple(buckets),
                                       method, exclusion_rule, int(n_exclude),
                                       iv_method, iv_exclusion_rule, int(iv_n_exclude),
                                       mode, int(min_days_per_bucket),
                                       cscv_metric, int(cscv_max_S), int(cscv_min_partition))
-        tables[mode] = dt.composite_score_table(grid, pbo, weights)
+        composite_tables[mode] = dt.composite_score_table(grid, pbo, weights)
+        st.write(f"✓ {MODE_LABELS[mode]} done ({i}/4)")
 
-    return tables
-
-
-composite_tables = _all_composites(
-    profile, lookbacks, buckets, method, exclusion_rule, n_exclude,
-    iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
-    iv_lookbacks, iv_buckets, iv_method, iv_exclusion_rule, iv_n_exclude,
-    min_days_per_bucket, cscv_metric, cscv_max_S, cscv_min_partition, weights,
-)
+    status.update(label="All 4 mode leaderboards computed", state="complete", expanded=False)
 
 # ── 4 separate leaderboards ──────────────────────────────────────────────────
 
