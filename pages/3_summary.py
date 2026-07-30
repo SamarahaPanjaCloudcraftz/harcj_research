@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import sys
 
+import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -87,7 +88,7 @@ with st.sidebar:
         key="bpv_method",
     )
     exclusion_rule = st.radio(
-        "BPV exclusion rule", options=["worst_pnl_dynamic", "highest_vol"],
+        "BPV exclusion rule", options=["highest_vol", "worst_pnl_dynamic"],
         format_func=lambda r: "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic" else "Highest-vol bucket(s)",
         key="bpv_rule",
     )
@@ -128,7 +129,7 @@ with st.sidebar:
         key="iv_method",
     )
     iv_exclusion_rule = st.radio(
-        "IV exclusion rule", options=["worst_pnl_dynamic", "highest_vol"],
+        "IV exclusion rule", options=["highest_vol", "worst_pnl_dynamic"],
         format_func=lambda r: "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic" else "Highest-IV bucket(s)",
         key="iv_rule",
     )
@@ -229,9 +230,12 @@ for mode in ("harcj_only", "iv_only", "and_both", "or_either"):
     display["max_daily_loss"] = display["max_daily_loss"].map(lambda v: f"{v:,.0f}")
     display["pbo"]            = display["pbo"].map(lambda v: f"{v:.3f}")
     display["composite"]      = display["composite"].map(lambda v: f"{v:.2f}")
+    for c in ["rank_avg_daily_pnl", "rank_sortino", "rank_max_daily_loss", "rank_pbo"]:
+        display[c] = display[c].map(lambda v: f"{v:.1f}")
     st.dataframe(
         display[["lookback", "n_buckets", "composite", "avg_daily_pnl", "sortino",
-                 "max_daily_loss", "pbo", "reliable"]],
+                 "max_daily_loss", "pbo", "rank_avg_daily_pnl", "rank_sortino",
+                 "rank_max_daily_loss", "rank_pbo", "reliable"]],
         use_container_width=True, hide_index=True,
     )
 
@@ -324,3 +328,75 @@ diff_freqs_selected = st.multiselect(
 )
 for freq_label in diff_freqs_selected:
     render_diff_bars(pnl_A, variant_A, pnl_B, variant_B, freq_label, "Across all modes")
+
+st.divider()
+
+# ── Variant day breakdown ────────────────────────────────────────────────────────
+
+st.header("Variant day breakdown")
+st.caption(
+    "Pick any number of variants — from any mode's pool, or the always-trade / "
+    "live static-threshold baselines — to compare side by side. For each: total "
+    "scored days, how many were cut off vs. traded, and — for cut-off days "
+    "specifically — what would have happened (positive/negative, and average "
+    "size) had the cutoff not applied, using the actual raw PnL for those dates "
+    "rather than the realized (zeroed-out) PnL."
+)
+
+breakdown_options = ["Always-trade (no cutoff)", "Static threshold"] + pool_labels
+
+
+def _variant_traded_mask(label: str) -> pd.Series:
+    if label == "Always-trade (no cutoff)":
+        return always["_traded_mask"]
+    if label == "Static threshold":
+        return static["_traded_mask"]
+    return get_cell(*pool_lookup[label]).traded_mask
+
+
+def _breakdown_row(label: str) -> dict:
+    traded_mask = _variant_traded_mask(label)
+    scored_dates = traded_mask.index
+    raw_pnl = df["pnl"].reindex(scored_dates)
+
+    skipped_mask = ~traded_mask
+    skipped_pnl = raw_pnl[skipped_mask]
+    traded_pnl  = raw_pnl[traded_mask]
+
+    skipped_pos = skipped_pnl[skipped_pnl > 0]
+    skipped_neg = skipped_pnl[skipped_pnl < 0]
+    traded_pos  = traded_pnl[traded_pnl > 0]
+    traded_neg  = traded_pnl[traded_pnl < 0]
+
+    traded_dates = scored_dates[traded_mask]
+
+    return {
+        "Variant":        label,
+        "Total days":     len(traded_mask),
+        "Traded from":    traded_dates.min().date() if len(traded_dates) else None,
+        "Traded to":      traded_dates.max().date() if len(traded_dates) else None,
+        "Cut off":        int(skipped_mask.sum()),
+        "Cutoff +":       int(len(skipped_pos)),
+        "Cutoff avg +":   skipped_pos.mean() if len(skipped_pos) else None,
+        "Cutoff -":       int(len(skipped_neg)),
+        "Cutoff avg -":   skipped_neg.mean() if len(skipped_neg) else None,
+        "Traded":         int(traded_mask.sum()),
+        "Traded +":       int(len(traded_pos)),
+        "Traded avg +":   traded_pos.mean() if len(traded_pos) else None,
+        "Traded -":       int(len(traded_neg)),
+        "Traded avg -":   traded_neg.mean() if len(traded_neg) else None,
+    }
+
+
+breakdown_selected = st.multiselect(
+    "Variants", breakdown_options, default=["Static threshold"], key="breakdown_variants",
+)
+
+if breakdown_selected:
+    rows = [_breakdown_row(lbl) for lbl in breakdown_selected]
+    breakdown_df = pd.DataFrame(rows).set_index("Variant")
+    for c in ["Cutoff avg +", "Cutoff avg -", "Traded avg +", "Traded avg -"]:
+        breakdown_df[c] = breakdown_df[c].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+    st.dataframe(breakdown_df, use_container_width=True)
+else:
+    st.info("Select at least one variant to see its breakdown.")

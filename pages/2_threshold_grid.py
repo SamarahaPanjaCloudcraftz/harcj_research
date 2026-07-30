@@ -82,7 +82,7 @@ with st.sidebar:
 
     exclusion_rule = st.radio(
         "BPV exclusion rule",
-        options=["worst_pnl_dynamic", "highest_vol"],
+        options=["highest_vol", "worst_pnl_dynamic"],
         format_func=lambda r: (
             "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic"
             else "Highest-vol bucket(s)"
@@ -153,7 +153,7 @@ with st.sidebar:
         )
         iv_exclusion_rule = st.radio(
             "IV exclusion rule",
-            options=["worst_pnl_dynamic", "highest_vol"],
+            options=["highest_vol", "worst_pnl_dynamic"],
             format_func=lambda r: (
                 "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic"
                 else "Highest-IV bucket(s)"
