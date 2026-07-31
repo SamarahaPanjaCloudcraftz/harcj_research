@@ -1,3 +1,7 @@
 __pycache__/
 *.pyc
 Baseline_backtest/
+dashboard_data/
+atm_iv/
+spot/
+
