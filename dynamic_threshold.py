@@ -227,6 +227,14 @@ class RunResult:
     daily_pnl: pd.Series = field(repr=False)
     traded_mask: pd.Series = field(repr=False)
     diagnostics: pd.DataFrame | None = field(default=None, repr=False)
+    warmup_shortfall_days: int = 0
+
+
+def _extra_history_offset(df: pd.DataFrame, extra_history: pd.Series | None) -> int:
+    """Number of extra_history rows strictly before df's own first date."""
+    if extra_history is None or len(extra_history) == 0:
+        return 0
+    return int((extra_history.index < df.index[0]).sum())
 
 
 def walk_forward_run(
@@ -243,12 +251,22 @@ def walk_forward_run(
     iv_mode: str = "harcj_only",         # one of IV_MODES
     min_days_per_bucket: int = 10,
     return_diagnostics: bool = False,
+    extra_history: pd.Series | None = None,
 ) -> RunResult:
     """
     Walk forward one day at a time. At day t, use the trailing `lookback`
     days strictly before t to derive bucket edges + the excluded set;
     apply that to t's own value to decide trade/no-trade; day t's own pnl
     is only used afterwards, to score that decision.
+
+    extra_history — optional value_col-equivalent series (e.g. a backtest
+    source's pre-inception BPV warm-up), indexed by date, for dates
+    strictly before df's own first row. Used ONLY to satisfy the trailing
+    lookback window so scoring can start at df's own first row instead of
+    its `lookback`-th — these dates are never themselves scored (no pnl
+    exists for them). If it doesn't cover the full `lookback`, df's own
+    first `warmup_shortfall_days` rows are still skipped (same behavior as
+    passing no extra_history at all, just less of it).
 
     return_diagnostics=True additionally records, per scored day: the
     day's own value, its bucket, the excluded-range(s) in force that day
@@ -261,18 +279,32 @@ def walk_forward_run(
 
     df = df.sort_index()
     n = len(df)
+
+    offset = _extra_history_offset(df, extra_history)
+    if offset:
+        extra = extra_history.sort_index()
+        extra = extra[extra.index < df.index[0]]
+        values = np.concatenate([extra.values, df[value_col].values])
+        pnls_padded = np.concatenate([np.full(offset, np.nan), df[pnl_col].values])
+    else:
+        values = df[value_col].values
+        pnls_padded = df[pnl_col].values
+
+    pnls = df[pnl_col].values
+    ivs  = df[iv_col].values if iv_col in df.columns else np.full(n, np.nan)
+
     decisions = pd.Series(False, index=df.index)
     realized  = pd.Series(0.0, index=df.index)
     diag_rows = [] if return_diagnostics else None
 
-    values = df[value_col].values
-    pnls   = df[pnl_col].values
-    ivs    = df[iv_col].values if iv_col in df.columns else np.full(n, np.nan)
+    warmup_shortfall_days = max(0, lookback - offset)
+    start_t = offset + warmup_shortfall_days   # == max(offset, lookback)
 
-    for t in range(lookback, n):
+    for t in range(start_t, offset + n):
         train_values = values[t - lookback: t]
-        train_pnls   = pnls[t - lookback: t]
+        train_pnls   = pnls_padded[t - lookback: t]
         today_val    = values[t]
+        j = t - offset   # position within df's own rows
 
         decision = _bucket_decision(train_values, train_pnls, today_val,
                                      n_buckets, method, exclusion_rule, n_exclude)
@@ -280,18 +312,18 @@ def walk_forward_run(
             continue
         harcj_trade = decision.trade
 
-        iv_today = ivs[t]
+        iv_today = ivs[j]
         iv_trade = (not np.isnan(iv_today)) and (iv_today <= iv_cutoff) if iv_cutoff is not None else None
 
         trade = _combine(harcj_trade, iv_trade, iv_mode)
 
-        decisions.iloc[t] = trade
+        decisions.iloc[j] = trade
         if trade:
-            realized.iloc[t] = pnls[t]
+            realized.iloc[j] = pnls[j]
 
         if return_diagnostics:
             diag_rows.append({
-                "date":                   df.index[t],
+                "date":                   df.index[j],
                 "value":                  float(today_val),
                 "bucket":                 decision.bucket,
                 "n_actual_buckets":       decision.n_actual,
@@ -301,10 +333,10 @@ def walk_forward_run(
                 "iv_value":               None if np.isnan(iv_today) else float(iv_today),
                 "iv_trade":               iv_trade,
                 "trade":                  trade,
-                "pnl":                    float(pnls[t]) if trade else 0.0,
+                "pnl":                    float(pnls[j]) if trade else 0.0,
             })
 
-    scored = decisions.index[lookback:] if n > lookback else decisions.index[:0]
+    scored = decisions.index[warmup_shortfall_days:] if n > warmup_shortfall_days else decisions.index[:0]
     daily_pnl   = realized.loc[scored]
     traded_mask = decisions.loc[scored]
 
@@ -324,6 +356,7 @@ def walk_forward_run(
         daily_pnl=daily_pnl,
         traded_mask=traded_mask,
         diagnostics=diagnostics,
+        warmup_shortfall_days=warmup_shortfall_days,
     )
 
 
@@ -349,6 +382,8 @@ def walk_forward_run_dual(
     iv_mode: str = "and_both",       # "and_both" | "or_either" only
     min_days_per_bucket: int = 10,
     return_diagnostics: bool = False,
+    harcj_extra_history: pd.Series | None = None,
+    iv_extra_history: pd.Series | None = None,
 ) -> RunResult:
     """
     Walk forward one day at a time, running TWO independent bucket-exclusion
@@ -357,6 +392,11 @@ def walk_forward_run_dual(
     `iv_mode`. Same no-lookahead discipline as walk_forward_run: each side's
     edges/exclusion set come only from that side's own trailing window,
     ending strictly before the day being judged.
+
+    harcj_extra_history / iv_extra_history — same idea as walk_forward_run's
+    extra_history, one per side, with independent offsets (each side's
+    lookback can be satisfied — or not — independently of the other's).
+    Scoring only starts once BOTH sides have a full trailing window.
 
     harcj_only/iv_only don't need this — use walk_forward_run directly,
     pointed at whichever single series matters (this function is only for
@@ -373,49 +413,74 @@ def walk_forward_run_dual(
 
     df = df.sort_index()
     n = len(df)
-    max_lookback = max(harcj.lookback, iv.lookback)
+
+    harcj_offset = _extra_history_offset(df, harcj_extra_history)
+    iv_offset    = _extra_history_offset(df, iv_extra_history)
+
+    if harcj_offset:
+        extra = harcj_extra_history.sort_index()
+        extra = extra[extra.index < df.index[0]]
+        harcj_values = np.concatenate([extra.values, df[harcj_value_col].values])
+        harcj_pnls   = np.concatenate([np.full(harcj_offset, np.nan), df[pnl_col].values])
+    else:
+        harcj_values = df[harcj_value_col].values
+        harcj_pnls   = df[pnl_col].values
+
+    if iv_offset:
+        extra = iv_extra_history.sort_index()
+        extra = extra[extra.index < df.index[0]]
+        iv_values = np.concatenate([extra.values, df[iv_value_col].values])
+        iv_pnls   = np.concatenate([np.full(iv_offset, np.nan), df[pnl_col].values])
+    else:
+        iv_values = df[iv_value_col].values
+        iv_pnls   = df[pnl_col].values
+
+    pnls = df[pnl_col].values
 
     decisions = pd.Series(False, index=df.index)
     realized  = pd.Series(0.0, index=df.index)
     diag_rows = [] if return_diagnostics else None
 
-    harcj_values = df[harcj_value_col].values
-    iv_values    = df[iv_value_col].values
-    pnls         = df[pnl_col].values
+    harcj_shortfall = max(0, harcj.lookback - harcj_offset)
+    iv_shortfall    = max(0, iv.lookback - iv_offset)
+    warmup_shortfall_days = max(harcj_shortfall, iv_shortfall)
 
-    for t in range(max_lookback, n):
+    for j in range(warmup_shortfall_days, n):
+        ht = harcj_offset + j
+        it = iv_offset + j
+
         harcj_decision = _bucket_decision(
-            harcj_values[t - harcj.lookback: t], pnls[t - harcj.lookback: t], harcj_values[t],
+            harcj_values[ht - harcj.lookback: ht], harcj_pnls[ht - harcj.lookback: ht], harcj_values[ht],
             harcj.n_buckets, harcj.method, harcj.exclusion_rule, harcj.n_exclude,
         )
         iv_decision = _bucket_decision(
-            iv_values[t - iv.lookback: t], pnls[t - iv.lookback: t], iv_values[t],
+            iv_values[it - iv.lookback: it], iv_pnls[it - iv.lookback: it], iv_values[it],
             iv.n_buckets, iv.method, iv.exclusion_rule, iv.n_exclude,
         )
         if harcj_decision is None or iv_decision is None:
             continue
 
         trade = _combine(harcj_decision.trade, iv_decision.trade, iv_mode)
-        decisions.iloc[t] = trade
+        decisions.iloc[j] = trade
         if trade:
-            realized.iloc[t] = pnls[t]
+            realized.iloc[j] = pnls[j]
 
         if return_diagnostics:
             diag_rows.append({
-                "date":                  df.index[t],
-                "harcj_value":           float(harcj_values[t]),
+                "date":                  df.index[j],
+                "harcj_value":           float(harcj_values[ht]),
                 "harcj_bucket":          harcj_decision.bucket,
-                "harcj_excluded_ranges": _excluded_ranges_for_display(harcj_decision, harcj_values[t]),
+                "harcj_excluded_ranges": _excluded_ranges_for_display(harcj_decision, harcj_values[ht]),
                 "harcj_trade":           harcj_decision.trade,
-                "iv_value":              float(iv_values[t]),
+                "iv_value":              float(iv_values[it]),
                 "iv_bucket":             iv_decision.bucket,
-                "iv_excluded_ranges":    _excluded_ranges_for_display(iv_decision, iv_values[t]),
+                "iv_excluded_ranges":    _excluded_ranges_for_display(iv_decision, iv_values[it]),
                 "iv_trade":              iv_decision.trade,
                 "trade":                 trade,
-                "pnl":                   float(pnls[t]) if trade else 0.0,
+                "pnl":                   float(pnls[j]) if trade else 0.0,
             })
 
-    scored = decisions.index[max_lookback:] if n > max_lookback else decisions.index[:0]
+    scored = decisions.index[warmup_shortfall_days:] if n > warmup_shortfall_days else decisions.index[:0]
     daily_pnl   = realized.loc[scored]
     traded_mask = decisions.loc[scored]
 
@@ -436,6 +501,7 @@ def walk_forward_run_dual(
         daily_pnl=daily_pnl,
         traded_mask=traded_mask,
         diagnostics=diagnostics,
+        warmup_shortfall_days=warmup_shortfall_days,
     )
 
 
@@ -452,6 +518,7 @@ def run_grid(
     iv_cutoff: float | None = None,
     iv_mode: str = "harcj_only",
     min_days_per_bucket: int = 10,
+    extra_history: pd.Series | None = None,
 ) -> dict:
     """
     Returns:
@@ -459,39 +526,50 @@ def run_grid(
           "metrics": {metric_name: DataFrame[index=bucket_counts, columns=lookbacks]},
           "reliable": DataFrame[index=bucket_counts, columns=lookbacks] (bool),
           "n_traded": DataFrame[...] (int, for context),
+          "warmup_shortfall_days": DataFrame[...] (int, for context — see
+              walk_forward_run's extra_history),
         }
 
     value_col defaults to BPV's "pred_vol_pct"; pass "iv_dynamic" (with
     iv_mode="harcj_only") to sweep the IV-only dynamic threshold instead —
     same grid mechanism, just bucketing a different series.
+
+    extra_history — see walk_forward_run; passed through to every cell.
     """
     metric_names = ["total_pnl", "avg_daily_pnl", "sortino", "sharpe", "win_rate", "drawdown", "max_daily_loss"]
     grids = {m: pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
               for m in metric_names}
     reliable = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=bool)
     n_traded = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
+    warmup_shortfall = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
 
+    max_history = len(df) + _extra_history_offset(df, extra_history)
     for L in lookbacks:
         for B in bucket_counts:
-            if L >= len(df):
+            if L >= max_history:
                 for m in metric_names:
                     grids[m].loc[B, L] = np.nan
                 reliable.loc[B, L] = False
                 n_traded.loc[B, L] = np.nan
+                warmup_shortfall.loc[B, L] = np.nan
                 continue
 
             result = walk_forward_run(
                 df, lookback=L, n_buckets=B, method=method,
                 exclusion_rule=exclusion_rule, n_exclude=n_exclude,
                 value_col=value_col, iv_cutoff=iv_cutoff, iv_mode=iv_mode,
-                min_days_per_bucket=min_days_per_bucket,
+                min_days_per_bucket=min_days_per_bucket, extra_history=extra_history,
             )
             for m in metric_names:
                 grids[m].loc[B, L] = result.metrics[m]
             reliable.loc[B, L] = result.reliable
             n_traded.loc[B, L] = result.metrics["n_traded"]
+            warmup_shortfall.loc[B, L] = result.warmup_shortfall_days
 
-    return {"metrics": grids, "reliable": reliable, "n_traded": n_traded}
+    return {
+        "metrics": grids, "reliable": reliable, "n_traded": n_traded,
+        "warmup_shortfall_days": warmup_shortfall,
+    }
 
 
 # ── PBO grid ───────────────────────────────────────────────────────────────────
@@ -511,6 +589,7 @@ def run_pbo_grid(
     cscv_metric: str = "sortino",
     max_S: int = 16,
     min_partition_size: int = 4,
+    extra_history: pd.Series | None = None,
 ) -> dict:
     """
     Probability of Backtest Overfitting (CSCV, Bailey et al. 2015), per grid
@@ -540,9 +619,10 @@ def run_pbo_grid(
     reliable = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=bool)
     n_combos = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
 
+    max_history = len(df) + _extra_history_offset(df, extra_history)
     for L in lookbacks:
         for B in bucket_counts:
-            if L >= len(df):
+            if L >= max_history:
                 pbo_grid.loc[B, L] = np.nan
                 reliable.loc[B, L]  = False
                 n_combos.loc[B, L]  = np.nan
@@ -552,7 +632,7 @@ def run_pbo_grid(
                 df, lookback=L, n_buckets=B, method=method,
                 exclusion_rule=exclusion_rule, n_exclude=n_exclude,
                 value_col=value_col, iv_cutoff=iv_cutoff, iv_mode=iv_mode,
-                min_days_per_bucket=min_days_per_bucket,
+                min_days_per_bucket=min_days_per_bucket, extra_history=extra_history,
             )
             common_idx = result.daily_pnl.index
             static_aligned = static_daily_pnl.reindex(common_idx).fillna(0.0)
@@ -669,12 +749,16 @@ def run_paired_grid(
     iv_n_exclude: int = 1,
     iv_mode: str = "and_both",
     min_days_per_bucket: int = 10,
+    harcj_extra_history: pd.Series | None = None,
+    iv_extra_history: pd.Series | None = None,
 ) -> dict:
     """
     Same (L, B) drives both BPV and IV simultaneously at each cell — but
     each side keeps its OWN bucketing method / exclusion rule / n_exclude
     (only the lookback and bucket count are forced equal, per the paired-
     grid design). Same return shape as run_grid().
+
+    harcj_extra_history / iv_extra_history — see walk_forward_run_dual.
     """
     metric_names = ["total_pnl", "avg_daily_pnl", "sortino", "sharpe", "win_rate", "drawdown", "max_daily_loss"]
     grids = {m: pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
@@ -682,9 +766,13 @@ def run_paired_grid(
     reliable = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=bool)
     n_traded = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
 
+    max_history = len(df) + max(
+        _extra_history_offset(df, harcj_extra_history),
+        _extra_history_offset(df, iv_extra_history),
+    )
     for L in lookbacks:
         for B in bucket_counts:
-            if L >= len(df):
+            if L >= max_history:
                 for m in metric_names:
                     grids[m].loc[B, L] = np.nan
                 reliable.loc[B, L] = False
@@ -698,6 +786,7 @@ def run_paired_grid(
             result = run_paired_cell(
                 df, harcj_params, iv_params, harcj_value_col=harcj_value_col, iv_value_col=iv_value_col,
                 iv_mode=iv_mode, min_days_per_bucket=min_days_per_bucket,
+                harcj_extra_history=harcj_extra_history, iv_extra_history=iv_extra_history,
             )
             for m in metric_names:
                 grids[m].loc[B, L] = result.metrics[m]
@@ -716,6 +805,8 @@ def run_paired_cell(
     iv_mode: str = "and_both",
     min_days_per_bucket: int = 10,
     return_diagnostics: bool = False,
+    harcj_extra_history: pd.Series | None = None,
+    iv_extra_history: pd.Series | None = None,
 ) -> RunResult:
     """
     One non-swept variant: harcj(L,B) and iv(L,B) fully independent. Thin
@@ -728,6 +819,7 @@ def run_paired_cell(
         harcj_value_col=harcj_value_col, iv_value_col=iv_value_col,
         iv_mode=iv_mode, min_days_per_bucket=min_days_per_bucket,
         return_diagnostics=return_diagnostics,
+        harcj_extra_history=harcj_extra_history, iv_extra_history=iv_extra_history,
     )
 
 
@@ -749,6 +841,8 @@ def run_paired_pbo_grid(
     cscv_metric: str = "sortino",
     max_S: int = 16,
     min_partition_size: int = 4,
+    harcj_extra_history: pd.Series | None = None,
+    iv_extra_history: pd.Series | None = None,
 ) -> dict:
     """PBO counterpart to run_paired_grid — same paired (L, B) sweep (each
     side keeping its own method/exclusion_rule/n_exclude), each cell's
@@ -760,9 +854,13 @@ def run_paired_pbo_grid(
     reliable = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=bool)
     n_combos = pd.DataFrame(index=bucket_counts, columns=lookbacks, dtype=float)
 
+    max_history = len(df) + max(
+        _extra_history_offset(df, harcj_extra_history),
+        _extra_history_offset(df, iv_extra_history),
+    )
     for L in lookbacks:
         for B in bucket_counts:
-            if L >= len(df):
+            if L >= max_history:
                 pbo_grid.loc[B, L] = np.nan
                 reliable.loc[B, L]  = False
                 n_combos.loc[B, L]  = np.nan
@@ -775,6 +873,7 @@ def run_paired_pbo_grid(
             result = run_paired_cell(
                 df, harcj_params, iv_params, harcj_value_col=harcj_value_col, iv_value_col=iv_value_col,
                 iv_mode=iv_mode, min_days_per_bucket=min_days_per_bucket,
+                harcj_extra_history=harcj_extra_history, iv_extra_history=iv_extra_history,
             )
             common_idx = result.daily_pnl.index
             static_aligned = static_daily_pnl.reindex(common_idx).fillna(0.0)
