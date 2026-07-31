@@ -29,6 +29,13 @@ PROFILE_TO_UNDERLYING = {
     "ndaq_persistence": "ndaq",
 }
 
+# Names the data source everything in this module currently reads from —
+# dashboard_new/dumps/, the live scheduler's staged output. Used by
+# disk_cache.py to namespace cached results by source, so a second source
+# (e.g. an extended backtest PnL feed) can be added later without its
+# cache entries colliding with or overwriting this one's.
+DATA_SOURCE_NAME = "live_dumps"
+
 
 def available_profiles() -> list[str]:
     return sorted(PROFILE_TO_UNDERLYING.keys())
