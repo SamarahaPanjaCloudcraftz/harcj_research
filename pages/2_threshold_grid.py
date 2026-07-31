@@ -19,10 +19,8 @@ import plotly.graph_objects as go
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data_loader import (
-    available_profiles, load_joined, load_static_config,
-    load_joined_with_iv, PROFILE_TO_UNDERLYING,
-)
+import data_loader
+import backtest_source
 import dynamic_threshold as dt
 from chart_helpers import (
     render_heatmap, render_multi_equity_curve, render_pnl_bars, render_diff_bars,
@@ -35,6 +33,15 @@ from grid_cache import (
     cached_iv_grid, cached_iv_pbo_grid, cached_iv_cell, cached_iv_baselines,
     cached_paired_grid, cached_paired_pbo_grid, cached_paired_cell, cached_paired_baselines,
 )
+
+_SOURCES = {
+    data_loader.DATA_SOURCE_NAME: data_loader,
+    backtest_source.DATA_SOURCE_NAME: backtest_source,
+}
+_SOURCE_LABELS = {
+    data_loader.DATA_SOURCE_NAME: "Live dumps (dashboard_new/dumps/)",
+    backtest_source.DATA_SOURCE_NAME: "Backtest — spxw_gamma_hedge_false",
+}
 
 st.set_page_config(page_title="Threshold Grid — HARCJ Research", layout="wide")
 st.title("Threshold Grid")
@@ -61,9 +68,20 @@ def _parse_int_list(raw: str) -> list[int]:
 with st.sidebar:
     st.header("Controls")
 
-    profile = st.selectbox("Profile", available_profiles(), index=0)
-    df = load_joined(profile)
+    source = st.selectbox(
+        "Data source", list(_SOURCES.keys()), index=0, format_func=lambda s: _SOURCE_LABELS[s],
+    )
+    loader = _SOURCES[source]
+    profile = st.selectbox("Profile", loader.available_profiles(), index=0)
+    df = loader.load_joined(profile)
     st.caption(f"Usable days: {len(df)} ({df.index.min().date()} → {df.index.max().date()})")
+    if source == backtest_source.DATA_SOURCE_NAME:
+        _sess_start, _sess_end = backtest_source.derive_session_window()
+        st.caption(
+            f"Session window auto-derived from blotter majority vote: "
+            f"{_sess_start}–{_sess_end} CT. Open-IV window defaults to the hour "
+            f"immediately before session start."
+        )
 
     st.subheader("BPV settings")
     lookback_raw = st.text_input("BPV lookback grid (trading days, comma-separated)",
@@ -73,6 +91,18 @@ with st.sidebar:
     lookbacks = _parse_int_list(lookback_raw)
     buckets   = _parse_int_list(bucket_raw)
 
+    _warmup_days_fn = getattr(loader, "available_warmup_days", None)
+    if _warmup_days_fn is not None:
+        _warmup_days = _warmup_days_fn(profile)
+        _short_lookbacks = [L for L in lookbacks if L > _warmup_days]
+        if _short_lookbacks:
+            st.warning(
+                f"Only {_warmup_days} days of pre-backtest BPV history available — "
+                f"lookback(s) {', '.join(map(str, _short_lookbacks))} exceed this, so "
+                f"those variants still start a few days into the backtest instead of "
+                f"at its first day."
+            )
+
     method = st.radio(
         "BPV bucketing method",
         options=["equal_count", "equal_width"],
@@ -80,15 +110,12 @@ with st.sidebar:
         key="bpv_method",
     )
 
-    exclusion_rule = st.radio(
-        "BPV exclusion rule",
-        options=["highest_vol", "worst_pnl_dynamic"],
-        format_func=lambda r: (
-            "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic"
-            else "Highest-vol bucket(s)"
-        ),
-        key="bpv_rule",
-    )
+    # Only rule-based exclusion is exposed: it needs no trailing PnL history
+    # (unlike the removed worst_pnl_dynamic rule), so it can be "ready" as
+    # soon as there's a trailing lookback window of values — see conversation
+    # history re: extending the backtest source's price history back of its
+    # PnL-scored range.
+    exclusion_rule = "highest_vol"
 
     n_exclude = st.number_input("BPV — number of buckets to exclude", min_value=1,
                                  max_value=10, value=1, step=1, key="bpv_n_exclude")
@@ -113,30 +140,44 @@ with st.sidebar:
     if show_iv_settings:
         st.divider()
         st.subheader("IV settings")
-        st.caption(
-            "IV gets the identical dynamic-threshold machinery as BPV, computed "
-            "from the raw 1-min IV dump (dumps/<underlying>_stage1/atm_iv/) — the "
-            "trustworthy source, not roll.csv's mean_iv (which can be stale for "
-            "recent days — see conversation history). Only the 07:30–08:30 CT "
-            "window has data; timestamps/ranges outside that will be empty."
-        )
+        if source == backtest_source.DATA_SOURCE_NAME:
+            _sess_start, _ = backtest_source.derive_session_window()
+            _default_iv_end = _sess_start
+            _default_iv_start = (
+                pd.Timestamp(_sess_start) - pd.Timedelta(hours=backtest_source.DEFAULT_IV_WINDOW_HOURS_BEFORE_START)
+            ).strftime("%H:%M")
+            st.caption(
+                "IV gets the identical dynamic-threshold machinery as BPV, computed "
+                "from research/atm_iv/SPWX/ (weekday-matched, 00:00–23:59 CT "
+                f"available, 2025 warm-up + this backtest's own 2026 days). Defaults "
+                f"to the hour before session start ({_default_iv_start}–{_default_iv_end})."
+            )
+        else:
+            _default_iv_start, _default_iv_end = "07:30", "08:30"
+            st.caption(
+                "IV gets the identical dynamic-threshold machinery as BPV, computed "
+                "from the raw 1-min IV dump (dumps/<underlying>_stage1/atm_iv/) — the "
+                "trustworthy source, not roll.csv's mean_iv (which can be stale for "
+                "recent days — see conversation history). Only the 07:30–08:30 CT "
+                "window has data; timestamps/ranges outside that will be empty."
+            )
 
         iv_source_mode = st.radio(
             "IV source",
-            options=["point", "mean"],
+            options=["mean", "point"],
             format_func=lambda m: "Open IV (single timestamp)" if m == "point" else "Open IV mean (window average)",
         )
         if iv_source_mode == "point":
-            iv_timestamp  = st.text_input("Timestamp (HH:MM, within 07:30–08:30)", value="08:30")
+            iv_timestamp  = st.text_input("Timestamp (HH:MM)", value=_default_iv_end)
             iv_start_time = None
             iv_end_time   = None
         else:
             iv_timestamp = None
             c1, c2 = st.columns(2)
             with c1:
-                iv_start_time = st.text_input("Window start (HH:MM)", value="07:30")
+                iv_start_time = st.text_input("Window start (HH:MM)", value=_default_iv_start)
             with c2:
-                iv_end_time = st.text_input("Window end (HH:MM)", value="08:30")
+                iv_end_time = st.text_input("Window end (HH:MM)", value=_default_iv_end)
 
         iv_lookback_raw = st.text_input("IV lookback grid (trading days, comma-separated)",
                                          value="20,40,60,90,120,180,252")
@@ -145,21 +186,25 @@ with st.sidebar:
         iv_lookbacks = _parse_int_list(iv_lookback_raw)
         iv_buckets   = _parse_int_list(iv_bucket_raw)
 
+        _iv_warmup_days_fn = getattr(loader, "available_iv_warmup_days", None)
+        if _iv_warmup_days_fn is not None:
+            _iv_warmup_days = _iv_warmup_days_fn(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time)
+            _short_iv_lookbacks = [L for L in iv_lookbacks if L > _iv_warmup_days]
+            if _short_iv_lookbacks:
+                st.warning(
+                    f"Only {_iv_warmup_days} days of pre-backtest IV history available — "
+                    f"lookback(s) {', '.join(map(str, _short_iv_lookbacks))} exceed this, so "
+                    f"those variants still start a few days into the backtest instead of "
+                    f"at its first day."
+                )
+
         iv_method = st.radio(
             "IV bucketing method",
             options=["equal_count", "equal_width"],
             format_func=lambda m: "Equal-count (quantile)" if m == "equal_count" else "Equal-width (range)",
             key="iv_method",
         )
-        iv_exclusion_rule = st.radio(
-            "IV exclusion rule",
-            options=["highest_vol", "worst_pnl_dynamic"],
-            format_func=lambda r: (
-                "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic"
-                else "Highest-IV bucket(s)"
-            ),
-            key="iv_rule",
-        )
+        iv_exclusion_rule = "highest_vol"
         iv_n_exclude = st.number_input("IV — number of buckets to exclude", min_value=1,
                                         max_value=10, value=1, step=1, key="iv_n_exclude")
     else:
@@ -171,15 +216,12 @@ with st.sidebar:
         iv_lookbacks, iv_buckets = lookbacks, buckets
         iv_method, iv_exclusion_rule, iv_n_exclude = method, exclusion_rule, n_exclude
 
-    st.divider()
-    min_days_per_bucket = st.number_input(
-        "Min days/bucket for 'reliable' (dynamic rule only)",
-        min_value=1, max_value=100, value=10, step=1,
-        help="Cells where lookback/n_buckets falls below this are flagged as "
-             "statistically thin for the worst-PnL dynamic rule. Applies to "
-             "both BPV and IV sides.",
-    )
+    # Was configurable for the worst-PnL dynamic rule's "reliable" flag (now
+    # removed) — the highest-vol/IV rule has no such reliability concern, so
+    # this is just the fixed value passed through to the grid functions.
+    min_days_per_bucket = 10
 
+    st.divider()
     metric = st.selectbox("Metric", list(METRIC_LABELS.keys()),
                            format_func=lambda m: METRIC_LABELS[m])
 
@@ -216,7 +258,7 @@ if not lookbacks or not buckets:
     st.warning("Enter at least one lookback and one bucket count.")
     st.stop()
 
-cfg = load_static_config(profile)
+cfg = loader.load_static_config(profile)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
@@ -231,14 +273,14 @@ for mode in iv_modes_selected:
 
     # ── Per-mode setup: grid_result / pbo_grid_result / combo lookup / get_cell ─
     if mode == "harcj_only":
-        always, static, _ = cached_baselines(profile, mode)
+        always, static, _ = cached_baselines(source, profile, mode)
         this_lookbacks, this_buckets = lookbacks, buckets
         grid_result = cached_grid(
-            profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
+            source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
             int(n_exclude), cfg["iv_cutoff"], mode, int(min_days_per_bucket),
         )
         pbo_grid_result = cached_pbo_grid(
-            profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
+            source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
             int(n_exclude), cfg["iv_cutoff"], mode, int(min_days_per_bucket),
             cscv_metric, int(cscv_max_S), int(cscv_min_partition),
         )
@@ -246,7 +288,7 @@ for mode in iv_modes_selected:
         combo_lookup = {f"L={L}, B={B}": (L, B) for L in lookbacks for B in buckets}
 
         def get_cell(L, B):
-            return cached_cell(profile, L, B, method, exclusion_rule,
+            return cached_cell(source, profile, L, B, method, exclusion_rule,
                                  int(n_exclude), cfg["iv_cutoff"], mode, int(min_days_per_bucket))
         cutoff_rule = exclusion_rule
 
@@ -255,15 +297,15 @@ for mode in iv_modes_selected:
             st.warning("Enter at least one IV lookback and bucket count in the sidebar's IV settings.")
             st.divider()
             continue
-        always, static = cached_iv_baselines(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time)
+        always, static = cached_iv_baselines(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time)
         this_lookbacks, this_buckets = iv_lookbacks, iv_buckets
         grid_result = cached_iv_grid(
-            profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
             int(iv_n_exclude), int(min_days_per_bucket),
         )
         pbo_grid_result = cached_iv_pbo_grid(
-            profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
             int(iv_n_exclude), int(min_days_per_bucket),
             cscv_metric, int(cscv_max_S), int(cscv_min_partition),
@@ -272,13 +314,13 @@ for mode in iv_modes_selected:
         combo_lookup = {f"L={L}, B={B}": (L, B) for L in iv_lookbacks for B in iv_buckets}
 
         def get_cell(L, B):
-            return cached_iv_cell(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            return cached_iv_cell(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                                     L, B, iv_method, iv_exclusion_rule, int(iv_n_exclude), int(min_days_per_bucket))
         cutoff_rule = iv_exclusion_rule
 
     else:  # and_both / or_either — paired grid, same (L, B) for both sides
         always, static = cached_paired_baselines(
-            profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time, mode,
+            source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time, mode,
         )
         this_lookbacks, this_buckets = lookbacks, buckets
         st.caption(
@@ -289,14 +331,14 @@ for mode in iv_modes_selected:
             "BPV vs. IV (L, B), use \"Specific combination\" below."
         )
         grid_result = cached_paired_grid(
-            profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             tuple(lookbacks), tuple(buckets),
             method, exclusion_rule, int(n_exclude),
             iv_method, iv_exclusion_rule, int(iv_n_exclude),
             mode, int(min_days_per_bucket),
         )
         pbo_grid_result = cached_paired_pbo_grid(
-            profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             tuple(lookbacks), tuple(buckets),
             method, exclusion_rule, int(n_exclude),
             iv_method, iv_exclusion_rule, int(iv_n_exclude),
@@ -307,7 +349,7 @@ for mode in iv_modes_selected:
 
         def get_cell(L, B):
             return cached_paired_cell(
-                profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+                source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                 L, B, L, B,
                 method, exclusion_rule, int(n_exclude),
                 iv_method, iv_exclusion_rule, int(iv_n_exclude),
@@ -446,7 +488,7 @@ for mode in iv_modes_selected:
             spec_iv_B = st.selectbox("IV buckets", iv_buckets or buckets, key=f"spec_iv_B_{mode}")
 
         spec_result = cached_paired_cell(
-            profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             spec_harcj_L, spec_harcj_B, spec_iv_L, spec_iv_B,
             method, exclusion_rule, int(n_exclude),
             iv_method, iv_exclusion_rule, int(iv_n_exclude),
@@ -467,6 +509,44 @@ for mode in iv_modes_selected:
             f"{spec_result.metrics['n_traded']}/{spec_result.metrics['n_days']} days traded — "
             f"reliable: {spec_result.reliable} — "
             f"PBO combinations: {spec_pbo['n_combinations']}"
+        )
+
+        spec_label = f"BPV L={spec_harcj_L},B={spec_harcj_B} / IV L={spec_iv_L},B={spec_iv_B}"
+
+        render_multi_equity_curve(
+            {spec_label: spec_result}, always, static,
+            f"Equity curve — Specific combination ({iv_label})",
+        )
+
+        spec_freqs_selected = st.multiselect(
+            "PnL bar frequency to show", list(_BAR_FREQ.keys()), default=["Weekly"],
+            key=f"spec_freqs_{mode}",
+        )
+        for freq_label in spec_freqs_selected:
+            render_pnl_bars({spec_label: spec_result}, always, static, freq_label,
+                             f"Specific combination ({iv_label})")
+
+        st.markdown(f"**Difference bars — Specific combination ({iv_label})**")
+        st.caption(
+            "This specific combination vs. any variant B — always-trade, the "
+            "static threshold, or any (lookback, n_buckets) from this grid."
+        )
+        spec_diff_options = ["Always-trade (no cutoff)", "Static threshold"] + combo_labels
+        spec_variant_B = st.selectbox(
+            "Variant B", spec_diff_options, index=0, key=f"spec_diffB_{mode}",
+        )
+        spec_pnl_B = _variant_daily_pnl(spec_variant_B)
+        spec_diff_freqs_selected = st.multiselect(
+            "Difference bar frequency to show", list(_BAR_FREQ.keys()), default=["Weekly"],
+            key=f"spec_diff_freqs_{mode}",
+        )
+        for freq_label in spec_diff_freqs_selected:
+            render_diff_bars(spec_result.daily_pnl, spec_label, spec_pnl_B, spec_variant_B,
+                              freq_label, iv_label)
+
+        render_cutoff_timeline(
+            spec_result, spec_iv_B, f"{spec_label} — Specific combination ({iv_label})",
+            rule=exclusion_rule,
         )
 
     st.divider()

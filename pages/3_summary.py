@@ -24,7 +24,8 @@ import pandas as pd
 import streamlit as st
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from data_loader import available_profiles, load_joined, load_static_config
+import data_loader
+import backtest_source
 import dynamic_threshold as dt
 from chart_helpers import (
     render_multi_equity_curve, render_pnl_bars, render_diff_bars, _BAR_FREQ,
@@ -34,6 +35,15 @@ from grid_cache import (
     cached_iv_grid, cached_iv_pbo_grid, cached_iv_cell, cached_iv_baselines,
     cached_paired_grid, cached_paired_pbo_grid, cached_paired_cell,
 )
+
+_SOURCES = {
+    data_loader.DATA_SOURCE_NAME: data_loader,
+    backtest_source.DATA_SOURCE_NAME: backtest_source,
+}
+_SOURCE_LABELS = {
+    data_loader.DATA_SOURCE_NAME: "Live dumps (dashboard_new/dumps/)",
+    backtest_source.DATA_SOURCE_NAME: "Backtest — spxw_gamma_hedge_false",
+}
 
 st.set_page_config(page_title="Summary — HARCJ Research", layout="wide")
 st.title("Summary")
@@ -71,9 +81,20 @@ def _parse_int_list(raw: str) -> list[int]:
 with st.sidebar:
     st.header("Controls")
 
-    profile = st.selectbox("Profile", available_profiles(), index=0)
-    df = load_joined(profile)
+    source = st.selectbox(
+        "Data source", list(_SOURCES.keys()), index=0, format_func=lambda s: _SOURCE_LABELS[s],
+    )
+    loader = _SOURCES[source]
+    profile = st.selectbox("Profile", loader.available_profiles(), index=0)
+    df = loader.load_joined(profile)
     st.caption(f"Usable days: {len(df)} ({df.index.min().date()} → {df.index.max().date()})")
+    if source == backtest_source.DATA_SOURCE_NAME:
+        _sess_start, _sess_end = backtest_source.derive_session_window()
+        st.caption(
+            f"Session window auto-derived from blotter majority vote: "
+            f"{_sess_start}–{_sess_end} CT. Open-IV window defaults to the hour "
+            f"immediately before session start."
+        )
 
     st.subheader("BPV settings")
     lookback_raw = st.text_input("BPV lookback grid (trading days, comma-separated)",
@@ -82,40 +103,63 @@ with st.sidebar:
     lookbacks = _parse_int_list(lookback_raw)
     buckets   = _parse_int_list(bucket_raw)
 
+    _warmup_days_fn = getattr(loader, "available_warmup_days", None)
+    if _warmup_days_fn is not None:
+        _warmup_days = _warmup_days_fn(profile)
+        _short_lookbacks = [L for L in lookbacks if L > _warmup_days]
+        if _short_lookbacks:
+            st.warning(
+                f"Only {_warmup_days} days of pre-backtest BPV history available — "
+                f"lookback(s) {', '.join(map(str, _short_lookbacks))} exceed this, so "
+                f"those variants still start a few days into the backtest instead of "
+                f"at its first day."
+            )
+
     method = st.radio(
         "BPV bucketing method", options=["equal_count", "equal_width"],
         format_func=lambda m: "Equal-count (quantile)" if m == "equal_count" else "Equal-width (range)",
         key="bpv_method",
     )
-    exclusion_rule = st.radio(
-        "BPV exclusion rule", options=["highest_vol", "worst_pnl_dynamic"],
-        format_func=lambda r: "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic" else "Highest-vol bucket(s)",
-        key="bpv_rule",
-    )
+    # Only rule-based exclusion is exposed — see Threshold Grid page for why
+    # the worst-PnL dynamic rule was removed.
+    exclusion_rule = "highest_vol"
     n_exclude = st.number_input("BPV — number of buckets to exclude", min_value=1,
                                  max_value=10, value=1, step=1, key="bpv_n_exclude")
 
     st.divider()
     st.subheader("IV settings")
-    st.caption(
-        "From the raw 1-min IV dump (the trustworthy source — see conversation "
-        "history on roll.csv's mean_iv staleness). Only 07:30–08:30 CT has data."
-    )
+    if source == backtest_source.DATA_SOURCE_NAME:
+        _sess_start, _ = backtest_source.derive_session_window()
+        _default_iv_end = _sess_start
+        _default_iv_start = (
+            pd.Timestamp(_sess_start) - pd.Timedelta(hours=backtest_source.DEFAULT_IV_WINDOW_HOURS_BEFORE_START)
+        ).strftime("%H:%M")
+        st.caption(
+            "From research/atm_iv/SPWX/ (weekday-matched, 00:00–23:59 CT "
+            "available, 2025 warm-up + this backtest's own 2026 days). Defaults "
+            f"to the hour before session start ({_default_iv_start}–{_default_iv_end})."
+        )
+    else:
+        _default_iv_start, _default_iv_end = "07:30", "08:30"
+        st.caption(
+            "From the raw 1-min IV dump (the trustworthy source — see conversation "
+            "history on roll.csv's mean_iv staleness). Only 07:30–08:30 CT has data."
+        )
     iv_source_mode = st.radio(
-        "IV source", options=["point", "mean"],
+        "IV source", options=["mean", "point"],
         format_func=lambda m: "Open IV (single timestamp)" if m == "point" else "Open IV mean (window average)",
     )
     if iv_source_mode == "point":
-        iv_timestamp  = st.text_input("Timestamp (HH:MM, within 07:30–08:30)", value="08:30")
+        iv_timestamp  = st.text_input("Timestamp (HH:MM)", value=_default_iv_end)
         iv_start_time = None
         iv_end_time   = None
     else:
         iv_timestamp = None
         c1, c2 = st.columns(2)
         with c1:
-            iv_start_time = st.text_input("Window start (HH:MM)", value="07:30")
+            iv_start_time = st.text_input("Window start (HH:MM)", value=_default_iv_start)
         with c2:
-            iv_end_time = st.text_input("Window end (HH:MM)", value="08:30")
+            iv_end_time = st.text_input("Window end (HH:MM)", value=_default_iv_end)
 
     iv_lookback_raw = st.text_input("IV lookback grid (trading days, comma-separated)",
                                      value="20,40,60,90,120,180,252")
@@ -123,23 +167,31 @@ with st.sidebar:
     iv_lookbacks = _parse_int_list(iv_lookback_raw)
     iv_buckets   = _parse_int_list(iv_bucket_raw)
 
+    _iv_warmup_days_fn = getattr(loader, "available_iv_warmup_days", None)
+    if _iv_warmup_days_fn is not None:
+        _iv_warmup_days = _iv_warmup_days_fn(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time)
+        _short_iv_lookbacks = [L for L in iv_lookbacks if L > _iv_warmup_days]
+        if _short_iv_lookbacks:
+            st.warning(
+                f"Only {_iv_warmup_days} days of pre-backtest IV history available — "
+                f"lookback(s) {', '.join(map(str, _short_iv_lookbacks))} exceed this, so "
+                f"those variants still start a few days into the backtest instead of "
+                f"at its first day."
+            )
+
     iv_method = st.radio(
         "IV bucketing method", options=["equal_count", "equal_width"],
         format_func=lambda m: "Equal-count (quantile)" if m == "equal_count" else "Equal-width (range)",
         key="iv_method",
     )
-    iv_exclusion_rule = st.radio(
-        "IV exclusion rule", options=["highest_vol", "worst_pnl_dynamic"],
-        format_func=lambda r: "Worst-PnL bucket(s), dynamic" if r == "worst_pnl_dynamic" else "Highest-IV bucket(s)",
-        key="iv_rule",
-    )
+    iv_exclusion_rule = "highest_vol"
     iv_n_exclude = st.number_input("IV — number of buckets to exclude", min_value=1,
                                     max_value=10, value=1, step=1, key="iv_n_exclude")
 
-    st.divider()
-    min_days_per_bucket = st.number_input(
-        "Min days/bucket for 'reliable'", min_value=1, max_value=100, value=10, step=1,
-    )
+    # Was configurable for the removed worst-PnL dynamic rule's "reliable"
+    # flag — highest-vol/IV has no such reliability concern, so this is just
+    # the fixed value passed through to the grid functions.
+    min_days_per_bucket = 10
 
     st.divider()
     st.subheader("PBO")
@@ -159,7 +211,7 @@ if not lookbacks or not buckets or not iv_lookbacks or not iv_buckets:
     st.warning("Enter at least one lookback and one bucket count for both BPV and IV.")
     st.stop()
 
-cfg = load_static_config(profile)
+cfg = loader.load_static_config(profile)
 weights = {"pbo": weight_pbo, "avg_daily_pnl": weight_avg_pnl,
            "sortino": weight_sortino, "max_daily_loss": weight_mdl}
 
@@ -175,21 +227,21 @@ weights = {"pbo": weight_pbo, "avg_daily_pnl": weight_avg_pnl,
 composite_tables = {}
 with st.status("Computing all 4 mode leaderboards…", expanded=True) as status:
     st.write("HARCJ only — grid…")
-    grid = cached_grid(profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
+    grid = cached_grid(source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
                         int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket))
     st.write("HARCJ only — PBO grid (this is usually the slow part)…")
-    pbo = cached_pbo_grid(profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
+    pbo = cached_pbo_grid(source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
                            int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket),
                            cscv_metric, int(cscv_max_S), int(cscv_min_partition))
     composite_tables["harcj_only"] = dt.composite_score_table(grid, pbo, weights)
     st.write("✓ HARCJ only done (1/4)")
 
     st.write("IV only — grid…")
-    grid = cached_iv_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+    grid = cached_iv_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                            tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
                            int(iv_n_exclude), int(min_days_per_bucket))
     st.write("IV only — PBO grid…")
-    pbo = cached_iv_pbo_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+    pbo = cached_iv_pbo_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                               tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
                               int(iv_n_exclude), int(min_days_per_bucket),
                               cscv_metric, int(cscv_max_S), int(cscv_min_partition))
@@ -198,13 +250,13 @@ with st.status("Computing all 4 mode leaderboards…", expanded=True) as status:
 
     for i, mode in enumerate(("and_both", "or_either"), start=3):
         st.write(f"{MODE_LABELS[mode]} — paired grid…")
-        grid = cached_paired_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+        grid = cached_paired_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                                    tuple(lookbacks), tuple(buckets),
                                    method, exclusion_rule, int(n_exclude),
                                    iv_method, iv_exclusion_rule, int(iv_n_exclude),
                                    mode, int(min_days_per_bucket))
         st.write(f"{MODE_LABELS[mode]} — paired PBO grid…")
-        pbo = cached_paired_pbo_grid(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+        pbo = cached_paired_pbo_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                                       tuple(lookbacks), tuple(buckets),
                                       method, exclusion_rule, int(n_exclude),
                                       iv_method, iv_exclusion_rule, int(iv_n_exclude),
@@ -246,7 +298,7 @@ st.divider()
 st.header("Compare variants across all modes")
 
 canonical_mode = _LIVE_MODE_MAP.get(cfg["flag_combine_method"], "harcj_only")
-always, static, _ = cached_baselines(profile, canonical_mode)
+always, static, _ = cached_baselines(source, profile, canonical_mode)
 st.caption(
     f"Reference lines use the live-configured combination mode for this profile "
     f"(`flag_combine_method={cfg['flag_combine_method']}` → {MODE_LABELS[canonical_mode]}), "
@@ -256,13 +308,13 @@ st.caption(
 
 def get_cell(mode: str, L: int, B: int):
     if mode == "harcj_only":
-        return cached_cell(profile, L, B, method, exclusion_rule,
+        return cached_cell(source, profile, L, B, method, exclusion_rule,
                             int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket))
     if mode == "iv_only":
-        return cached_iv_cell(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+        return cached_iv_cell(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                                L, B, iv_method, iv_exclusion_rule, int(iv_n_exclude), int(min_days_per_bucket))
     return cached_paired_cell(
-        profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+        source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
         L, B, L, B, method, exclusion_rule, int(n_exclude),
         iv_method, iv_exclusion_rule, int(iv_n_exclude), mode, int(min_days_per_bucket),
     )
@@ -400,3 +452,58 @@ if breakdown_selected:
     st.dataframe(breakdown_df, use_container_width=True)
 else:
     st.info("Select at least one variant to see its breakdown.")
+
+st.subheader("Compare two variants — cutoff overlap")
+st.caption(
+    "A and B usually cover different date ranges (different lookbacks start "
+    "scoring at different points), so comparing their raw cutoff counts "
+    "directly is misleading. This splits each variant's cut-off dates into "
+    "three buckets — dates cut off by A only, by B only, and by both — and "
+    "shows the same stats (using actual raw PnL) for each bucket, so the "
+    "comparison only ever covers dates both variants actually had an opinion on."
+)
+
+cc1, cc2 = st.columns(2)
+with cc1:
+    cmp_A = st.selectbox("Variant A", breakdown_options, index=1, key="cmp_variant_A")  # "Static threshold"
+with cc2:
+    cmp_B_default = 2 if len(breakdown_options) > 2 else 0  # first pool variant, not "Always-trade"
+    cmp_B = st.selectbox("Variant B", breakdown_options, index=cmp_B_default, key="cmp_variant_B")
+
+mask_A = _variant_traded_mask(cmp_A)
+mask_B = _variant_traded_mask(cmp_B)
+cutoff_A = set(mask_A.index[~mask_A])
+cutoff_B = set(mask_B.index[~mask_B])
+
+common    = cutoff_A & cutoff_B
+only_A    = cutoff_A - common
+only_B    = cutoff_B - common
+
+
+def _date_set_stats(dates) -> dict:
+    idx = pd.DatetimeIndex(sorted(dates))
+    raw = df["pnl"].reindex(idx)
+    pos = raw[raw > 0]
+    neg = raw[raw < 0]
+    return {
+        "Days":         len(idx),
+        "Positive":     int(len(pos)),
+        "Avg positive": pos.mean() if len(pos) else None,
+        "Negative":     int(len(neg)),
+        "Avg negative": neg.mean() if len(neg) else None,
+    }
+
+
+cmp_rows = {
+    f"A only ({cmp_A})":          _date_set_stats(only_A),
+    f"Common (both cut off)":     _date_set_stats(common),
+    f"B only ({cmp_B})":          _date_set_stats(only_B),
+}
+cmp_df = pd.DataFrame(cmp_rows).T
+cmp_df["Avg positive"] = cmp_df["Avg positive"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+cmp_df["Avg negative"] = cmp_df["Avg negative"].map(lambda v: f"{v:,.0f}" if pd.notna(v) else "—")
+st.dataframe(cmp_df, use_container_width=True)
+st.caption(
+    f"Total cutoff days — A: {len(cutoff_A)}, B: {len(cutoff_B)}, "
+    f"overlap: {len(common)} ({len(common) / max(len(cutoff_A | cutoff_B), 1):.0%} of the union)."
+)
