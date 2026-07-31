@@ -253,30 +253,11 @@ def render_diff_bars(pnl_A: pd.Series, label_A: str, pnl_B: pd.Series, label_B: 
     st.caption(f"Blue = A (\"{label_A}\") ahead that period; red = B (\"{label_B}\") ahead.")
 
 
-def render_cutoff_timeline(result, n_buckets_configured: int, title: str, rule: str = "worst_pnl_dynamic"):
-    """
-    One chart: pred_vol_pct per day (line + points), with that day's own
-    excluded value-range(s) shaded directly behind it (translucent red
-    rectangles, one per excluded range per day — handles non-contiguous
-    exclusions for worst_pnl_dynamic honestly rather than assuming a single
-    clean cutoff line). Points are colored by trade outcome using colors
-    that don't disappear against the red shading (blue=traded, ink=skipped —
-    deliberately not red-on-red).
-
-    Below the chart: descriptive stats (mean/median/std) of the daily
-    "cutoff" — the lower edge of the lowest-indexed excluded bucket each
-    day. For highest_vol this IS the one-sided cutoff (exclusion is always
-    contiguous from the top). For worst_pnl_dynamic it's only a proxy —
-    the excluded region can be a middle bucket or non-contiguous, so this
-    number doesn't necessarily mean "skip above this value."
-    """
-    diag = result.diagnostics
-    if diag is None or diag.empty:
-        st.info("No diagnostics available for this cell.")
-        return
-
+def _cutoff_timeline_figure(diag: pd.DataFrame, value_col: str, excluded_col: str,
+                             trade_col: str, title: str, y_axis_title: str):
+    """Shared figure-builder for one side's (single, or one half of a paired) cutoff timeline."""
     dates = diag.index
-    colors = [_BLUE if t else _INK for t in diag["trade"]]
+    colors = [_BLUE if t else _INK for t in diag[trade_col]]
 
     if len(dates) > 1:
         half = (dates.to_series().diff().dropna().median()) * 0.4
@@ -284,7 +265,7 @@ def render_cutoff_timeline(result, n_buckets_configured: int, title: str, rule: 
         half = pd.Timedelta(days=1) * 0.4
 
     shapes = []
-    for date, excluded_ranges in zip(dates, diag["excluded_ranges"]):
+    for date, excluded_ranges in zip(dates, diag[excluded_col]):
         for lo, hi in excluded_ranges:
             shapes.append(dict(
                 type="rect", xref="x", yref="y",
@@ -295,37 +276,35 @@ def render_cutoff_timeline(result, n_buckets_configured: int, title: str, rule: 
 
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=dates, y=diag["value"], mode="lines",
+        x=dates, y=diag[value_col], mode="lines",
         line=dict(color=_MUTED, width=1), hoverinfo="skip", showlegend=False,
     ))
     fig.add_trace(go.Scatter(
-        x=dates, y=diag["value"], mode="markers",
+        x=dates, y=diag[value_col], mode="markers",
         marker=dict(color=colors, size=6, line=dict(color="white", width=0.5)),
-        customdata=diag["trade"],
+        customdata=diag[trade_col],
         hovertemplate="%{x|%Y-%m-%d}<br>value: %{y:.2f}<br>traded: %{customdata}<extra></extra>",
         showlegend=False,
     ))
     fig.update_layout(shapes=shapes)
     fig.update_layout(
-        title=f"{title} — daily value, with that day's excluded range shaded",
-        yaxis_title="pred_vol_pct (or raw BPV)",
+        title=title,
+        yaxis_title=y_axis_title,
         xaxis_title="Date",
         plot_bgcolor="rgba(0,0,0,0)", paper_bgcolor="rgba(0,0,0,0)",
         xaxis=dict(gridcolor=_GRID), yaxis=dict(gridcolor=_GRID),
         margin=dict(l=10, r=10, t=40, b=10), height=420,
     )
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption(
-        "Red shading = the excluded value range(s) in force that day (from the "
-        "trailing window, recomputed daily). Blue points = traded, dark points = "
-        "skipped — a dark point should always fall inside its own day's red band."
-    )
+    return fig
 
-    cutoff_series = diag["excluded_ranges"].map(
+
+def _cutoff_stats(diag: pd.DataFrame, excluded_col: str, rule: str, heading: str):
+    """Shared descriptive-stats block for one side's cutoff."""
+    cutoff_series = diag[excluded_col].map(
         lambda ranges: min(lo for lo, hi in ranges) if ranges else np.nan
     ).dropna()
 
-    st.markdown("**Cutoff descriptive stats**")
+    st.markdown(f"**{heading}**")
     if rule == "highest_vol":
         st.caption(
             "highest_vol always excludes the top bucket(s), so this is a true "
@@ -347,6 +326,74 @@ def render_cutoff_timeline(result, n_buckets_configured: int, title: str, rule: 
         c2.metric("Median", f"{cutoff_series.median():.2f}")
         c3.metric("Std dev", f"{cutoff_series.std():.2f}")
         c4.metric("Days w/ exclusion", f"{len(cutoff_series)}")
+
+
+def render_cutoff_timeline(result, n_buckets_configured: int, title: str, rule: str = "worst_pnl_dynamic"):
+    """
+    One chart: pred_vol_pct per day (line + points), with that day's own
+    excluded value-range(s) shaded directly behind it (translucent red
+    rectangles, one per excluded range per day — handles non-contiguous
+    exclusions for worst_pnl_dynamic honestly rather than assuming a single
+    clean cutoff line). Points are colored by trade outcome using colors
+    that don't disappear against the red shading (blue=traded, ink=skipped —
+    deliberately not red-on-red).
+
+    Below the chart: descriptive stats (mean/median/std) of the daily
+    "cutoff" — the lower edge of the lowest-indexed excluded bucket each
+    day. For highest_vol this IS the one-sided cutoff (exclusion is always
+    contiguous from the top). For worst_pnl_dynamic it's only a proxy —
+    the excluded region can be a middle bucket or non-contiguous, so this
+    number doesn't necessarily mean "skip above this value."
+
+    Paired-mode results (and_both/or_either — from walk_forward_run_dual)
+    carry TWO independent diagnostics (harcj_* and iv_*, no plain
+    value/excluded_ranges) — rendered as two separate timelines/stats
+    blocks, one per side, since each side's cutoff is genuinely independent
+    that day.
+    """
+    diag = result.diagnostics
+    if diag is None or diag.empty:
+        st.info("No diagnostics available for this cell.")
+        return
+
+    if "harcj_value" in diag.columns:
+        st.caption(
+            "Paired mode: BPV and IV each have their own independent daily "
+            "cutoff — shown separately below."
+        )
+        fig_harcj = _cutoff_timeline_figure(
+            diag, "harcj_value", "harcj_excluded_ranges", "harcj_trade",
+            f"{title} — BPV daily value, with that day's excluded range shaded",
+            "pred_vol_pct (or raw BPV)",
+        )
+        st.plotly_chart(fig_harcj, use_container_width=True)
+        fig_iv = _cutoff_timeline_figure(
+            diag, "iv_value", "iv_excluded_ranges", "iv_trade",
+            f"{title} — IV daily value, with that day's excluded range shaded",
+            "iv_dynamic",
+        )
+        st.plotly_chart(fig_iv, use_container_width=True)
+        st.caption(
+            "Red shading = the excluded value range(s) in force that day (from the "
+            "trailing window, recomputed daily). Blue points = traded, dark points = "
+            "skipped — a dark point should always fall inside its own day's red band."
+        )
+        _cutoff_stats(diag, "harcj_excluded_ranges", rule, "BPV cutoff descriptive stats")
+        _cutoff_stats(diag, "iv_excluded_ranges", rule, "IV cutoff descriptive stats")
+        return
+
+    fig = _cutoff_timeline_figure(
+        diag, "value", "excluded_ranges", "trade",
+        f"{title} — daily value, with that day's excluded range shaded",
+        "pred_vol_pct (or raw BPV)",
+    )
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(
+        "Red shading = the excluded value range(s) in force that day (from the "
+        "trailing window, recomputed daily). Blue points = traded, dark points = "
+        "skipped — a dark point should always fall inside its own day's red band."
+    )
+    _cutoff_stats(diag, "excluded_ranges", rule, "Cutoff descriptive stats")
 
 
 def render_reference(always: dict, static: dict, cfg: dict, metric: str, iv_label: str):
