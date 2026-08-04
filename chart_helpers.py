@@ -132,7 +132,8 @@ def _common_start(cell_results: dict) -> pd.Timestamp | None:
     return max(starts) if starts else None
 
 
-def render_multi_equity_curve(cell_results: dict, always: dict, static: dict, title: str):
+def render_multi_equity_curve(cell_results: dict, always: dict, static: dict, title: str,
+                               static_label: str = "Static threshold"):
     """
     Cumulative PnL, one line per selected (L, B) combo, plus always-trade
     and today's static threshold as reference lines — all sliced to the
@@ -161,7 +162,7 @@ def render_multi_equity_curve(cell_results: dict, always: dict, static: dict, ti
     fig.add_trace(go.Scatter(x=common_idx, y=always_cum, mode="lines",
                               name="Always-trade", line=dict(color=_MUTED, width=1.5, dash="dot")))
     fig.add_trace(go.Scatter(x=common_idx, y=static_cum, mode="lines",
-                              name="Static threshold", line=dict(color=_INK, width=1.5, dash="dash")))
+                              name=static_label, line=dict(color=_INK, width=1.5, dash="dash")))
     fig.add_hline(y=0, line_color=_MUTED, line_width=1)
     fig.update_layout(
         title=dict(text=title, y=0.97, yanchor="top"),
@@ -178,7 +179,8 @@ def render_multi_equity_curve(cell_results: dict, always: dict, static: dict, ti
     )
 
 
-def render_pnl_bars(cell_results: dict, always: dict, static: dict, freq_label: str, title: str):
+def render_pnl_bars(cell_results: dict, always: dict, static: dict, freq_label: str, title: str,
+                     static_label: str = "Static threshold"):
     """Grouped bar chart, one color per selected combo plus the two
     reference baselines, aggregated to the given frequency (None = daily,
     no resampling)."""
@@ -203,7 +205,7 @@ def render_pnl_bars(cell_results: dict, always: dict, static: dict, freq_label: 
     static_s = _agg(static["_daily_pnl"])
     fig.add_trace(go.Bar(x=always_s.index, y=always_s.values, name="Always-trade",
                           marker_color=_MUTED))
-    fig.add_trace(go.Bar(x=static_s.index, y=static_s.values, name="Static threshold",
+    fig.add_trace(go.Bar(x=static_s.index, y=static_s.values, name=static_label,
                           marker_color=_INK))
 
     fig.add_hline(y=0, line_color=_MUTED, line_width=1)
