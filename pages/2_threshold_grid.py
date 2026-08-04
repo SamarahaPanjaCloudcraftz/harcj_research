@@ -34,14 +34,19 @@ from grid_cache import (
     cached_paired_grid, cached_paired_pbo_grid, cached_paired_cell, cached_paired_baselines,
 )
 
-_SOURCES = {
-    data_loader.DATA_SOURCE_NAME: data_loader,
-    backtest_source.DATA_SOURCE_NAME: backtest_source,
+_SOURCES = {data_loader.DATA_SOURCE_NAME: data_loader}
+_SOURCES.update({src.DATA_SOURCE_NAME: src for src in backtest_source.ALL_SOURCES})
+
+_BACKTEST_LABELS = {
+    "spxw_gamma_hedge_false": "Backtest — spxw_gamma_hedge_false",
+    "spxw_delta_condor_0830_1200": "Backtest — SPXW delta-condor 08:30–12:00",
+    "ndaq_delta_condor_0830_1200": "Backtest — NDAQ delta-condor 08:30–12:00",
+    "ndaq_delta_condor_0600_1000": "Backtest — NDAQ delta-condor 06:00–10:00",
 }
-_SOURCE_LABELS = {
-    data_loader.DATA_SOURCE_NAME: "Live dumps (dashboard_new/dumps/)",
-    backtest_source.DATA_SOURCE_NAME: "Backtest — spxw_gamma_hedge_false",
-}
+_SOURCE_LABELS = {data_loader.DATA_SOURCE_NAME: "Live dumps (dashboard_new/dumps/)"}
+_SOURCE_LABELS.update({
+    name: _BACKTEST_LABELS.get(name, f"Backtest — {name}") for name in _SOURCES if name != data_loader.DATA_SOURCE_NAME
+})
 
 st.set_page_config(page_title="Threshold Grid — HARCJ Research", layout="wide")
 st.title("Threshold Grid")
@@ -75,8 +80,8 @@ with st.sidebar:
     profile = st.selectbox("Profile", loader.available_profiles(), index=0)
     df = loader.load_joined(profile)
     st.caption(f"Usable days: {len(df)} ({df.index.min().date()} → {df.index.max().date()})")
-    if source == backtest_source.DATA_SOURCE_NAME:
-        _sess_start, _sess_end = backtest_source.derive_session_window()
+    if isinstance(loader, backtest_source.BacktestSource):
+        _sess_start, _sess_end = loader.derive_session_window()
         st.caption(
             f"Session window auto-derived from blotter majority vote: "
             f"{_sess_start}–{_sess_end} CT. Open-IV window defaults to the hour "
@@ -85,7 +90,7 @@ with st.sidebar:
 
     st.subheader("BPV settings")
     lookback_raw = st.text_input("BPV lookback grid (trading days, comma-separated)",
-                                  value="20,40,60,90,120,180,252")
+                                  value="60,90,120,180")
     bucket_raw   = st.text_input("BPV bucket-count grid (comma-separated)",
                                   value="4,5,8,10")
     lookbacks = _parse_int_list(lookback_raw)
@@ -140,8 +145,8 @@ with st.sidebar:
     if show_iv_settings:
         st.divider()
         st.subheader("IV settings")
-        if source == backtest_source.DATA_SOURCE_NAME:
-            _sess_start, _ = backtest_source.derive_session_window()
+        if isinstance(loader, backtest_source.BacktestSource):
+            _sess_start, _ = loader.derive_session_window()
             _default_iv_end = _sess_start
             _default_iv_start = (
                 pd.Timestamp(_sess_start) - pd.Timedelta(hours=backtest_source.DEFAULT_IV_WINDOW_HOURS_BEFORE_START)
@@ -180,7 +185,7 @@ with st.sidebar:
                 iv_end_time = st.text_input("Window end (HH:MM)", value=_default_iv_end)
 
         iv_lookback_raw = st.text_input("IV lookback grid (trading days, comma-separated)",
-                                         value="20,40,60,90,120,180,252")
+                                         value="60,90,120,180")
         iv_bucket_raw   = st.text_input("IV bucket-count grid (comma-separated)",
                                          value="4,5,8,10")
         iv_lookbacks = _parse_int_list(iv_lookback_raw)

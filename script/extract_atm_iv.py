@@ -1,8 +1,7 @@
 """
-Extracts daily 1-min atm_iv series from the current backtest source
-(backtests/spxw_gamma_hedge_false/2026/), one CSV per date, into
-research/atm_iv/SPWX/ — the IV counterpart of research/spot/SPWX/
-(see script/extract_spot.py).
+Extracts daily 1-min atm_iv series from a 2026 backtest source, one CSV per
+date, into research/atm_iv/<TAG>/ — the IV counterpart of
+research/spot/<TAG>/ (see script/extract_spot.py).
 
 Unlike spot (byte-identical across all 5 DOW folders — pure market replay),
 atm_iv genuinely differs across folders for the same date: each DOW folder
@@ -20,14 +19,18 @@ mean-IV from a clean daily series independent of backtest folder layout —
 the same way it already does for spot — regardless of what folder
 structure or time range a future backtest source uses.
 
-Scoped to the CURRENT 2026 backtest only (not a 2025 warm-up — the
-cross-folder atm_iv discrepancy is being investigated separately before any
-IV warm-up history gets built).
+Rows with no atm_iv (e.g. outside that variant's priced session — seen on
+NDAQ, null after ~15:00) are dropped.
 
-Output: one CSV per date, columns "timestamp,atm_iv", full 00:00-23:59 CT
-1-min series (each source minute is deduped from its trade_done True/False
-pair — atm_iv is identical either way, so the last row per timestamp is
-kept).
+Output: one CSV per date, columns "timestamp,atm_iv", 1-min series (each
+source minute is deduped from its trade_done True/False pair — atm_iv is
+identical either way, so the last row per timestamp is kept).
+
+Reusable for other underlyings/backtests via --source-dir/--out-dir, e.g.
+for NDAQ:
+    python3 extract_atm_iv.py \\
+        --source-dir ../../backtests/ndaq_delta_condor_trade_start_time_08-30_delta_condor_trade_stop_time_12-00_gamma_hedge_false/2026 \\
+        --out-dir ../atm_iv/NDAQ
 
 Usage:
     python3 extract_atm_iv.py
@@ -35,24 +38,24 @@ Usage:
 
 from __future__ import annotations
 
+import argparse
 import glob
 import os
-import sys
 
 import pandas as pd
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _RESEARCH_DIR = os.path.dirname(_HERE)
 _REPO_ROOT = os.path.dirname(_RESEARCH_DIR)
-_SOURCE_DIR = os.path.join(_REPO_ROOT, "backtests", "spxw_gamma_hedge_false", "2026")
-_OUT_DIR = os.path.join(_RESEARCH_DIR, "atm_iv", "SPWX")
+_DEFAULT_SOURCE_DIR = os.path.join(_REPO_ROOT, "backtests", "spxw_gamma_hedge_false", "2026")
+_DEFAULT_OUT_DIR = os.path.join(_RESEARCH_DIR, "atm_iv", "SPWX")
 
 _DOW_TO_WEEKDAY = {"MON": 0, "TUE": 1, "WED": 2, "THU": 3, "FRI": 4}
 
 
-def _list_dow_backtest_files(dow: str) -> dict[str, str]:
+def _list_dow_backtest_files(source_dir: str, dow: str) -> dict[str, str]:
     """date string (YYYYMMDD) -> file path, for one DOW folder."""
-    pattern = os.path.join(_SOURCE_DIR, dow, "backtest", "*.csv")
+    pattern = os.path.join(source_dir, dow, "backtest", "*.csv")
     out = {}
     for f in glob.glob(pattern):
         name = os.path.basename(f)
@@ -63,14 +66,14 @@ def _list_dow_backtest_files(dow: str) -> dict[str, str]:
     return out
 
 
-def _resolve_date_to_file() -> dict[str, str]:
+def _resolve_date_to_file(source_dir: str) -> dict[str, str]:
     """
     For each date, only the DOW folder whose weekday matches that date's
     actual calendar weekday — same rule as backtest_source.list_active_days().
     """
     resolved: dict[str, str] = {}
     for dow, weekday in _DOW_TO_WEEKDAY.items():
-        for date_str, path in _list_dow_backtest_files(dow).items():
+        for date_str, path in _list_dow_backtest_files(source_dir, dow).items():
             if pd.Timestamp(date_str).weekday() != weekday:
                 continue
             resolved[date_str] = path
@@ -79,23 +82,31 @@ def _resolve_date_to_file() -> dict[str, str]:
 
 def _extract_one(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, usecols=["timestamp", "atm_iv"], parse_dates=["timestamp"])
+    df = df.dropna(subset=["atm_iv"])
     df = df.drop_duplicates(subset="timestamp", keep="last").sort_values("timestamp")
     return df
 
 
 def main():
-    os.makedirs(_OUT_DIR, exist_ok=True)
-    date_to_file = _resolve_date_to_file()
-    print(f"Found {len(date_to_file)} weekday-matched dates in {_SOURCE_DIR}.")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--source-dir", default=_DEFAULT_SOURCE_DIR, help="<...>/2026 folder with MON..FRI subfolders")
+    parser.add_argument("--out-dir", default=_DEFAULT_OUT_DIR, help="research/atm_iv/<TAG> output directory")
+    args = parser.parse_args()
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    date_to_file = _resolve_date_to_file(args.source_dir)
+    print(f"Found {len(date_to_file)} weekday-matched dates in {args.source_dir}.")
 
     written = 0
     for date_str in sorted(date_to_file):
-        out_path = os.path.join(_OUT_DIR, f"{date_str}.csv")
+        out_path = os.path.join(args.out_dir, f"{date_str}.csv")
         df = _extract_one(date_to_file[date_str])
+        if df.empty:
+            continue
         df.to_csv(out_path, index=False)
         written += 1
 
-    print(f"Wrote {written} daily atm_iv CSVs to {_OUT_DIR}")
+    print(f"Wrote {written} daily atm_iv CSVs to {args.out_dir}")
 
 
 if __name__ == "__main__":
