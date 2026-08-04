@@ -1,11 +1,13 @@
 """
-Summary — cross-mode leaderboards + unified variant comparison.
+Summary — global cross-mode ranking + unified variant comparison.
 
 Computes all 4 IV-combination modes (harcj_only, iv_only, and_both,
-or_either) from ONE set of sidebar settings, shows each mode's own
-composite-score leaderboard separately (never merged into one ranking —
-each mode's pool of variants is its own population), then lets you pick
-any variants from ANY of those pools (plus the always-trade and static-
+or_either) from ONE set of sidebar settings, and ranks every (lookback,
+n_buckets) cell from EVERY mode together in a single global leaderboard —
+each cell's PBO is measured against the SAME baseline (the profile's actual
+live-configured combination), so pooling all 4 modes into one ranking is
+apples-to-apples, not four separate, non-comparable ones. Then lets you
+pick any variants from any mode's pool (plus the always-trade and static-
 threshold baselines) to overlay on the same equity curve / PnL bars /
 difference bars already used on the Threshold Grid page.
 
@@ -31,19 +33,25 @@ from chart_helpers import (
     render_multi_equity_curve, render_pnl_bars, render_diff_bars, _BAR_FREQ,
 )
 from grid_cache import (
-    cached_grid, cached_baselines, cached_cell, cached_pbo_grid,
-    cached_iv_grid, cached_iv_pbo_grid, cached_iv_cell, cached_iv_baselines,
-    cached_paired_grid, cached_paired_pbo_grid, cached_paired_cell,
+    cached_grid, cached_baselines, cached_cell,
+    cached_iv_grid, cached_iv_cell, cached_iv_baselines,
+    cached_paired_grid, cached_paired_cell,
+    cached_pbo_grid_vs_mode, cached_iv_pbo_grid_vs_mode, cached_paired_pbo_grid_vs_mode,
 )
 
-_SOURCES = {
-    data_loader.DATA_SOURCE_NAME: data_loader,
-    backtest_source.DATA_SOURCE_NAME: backtest_source,
+_SOURCES = {data_loader.DATA_SOURCE_NAME: data_loader}
+_SOURCES.update({src.DATA_SOURCE_NAME: src for src in backtest_source.ALL_SOURCES})
+
+_BACKTEST_LABELS = {
+    "spxw_gamma_hedge_false": "Backtest — spxw_gamma_hedge_false",
+    "spxw_delta_condor_0830_1200": "Backtest — SPXW delta-condor 08:30–12:00",
+    "ndaq_delta_condor_0830_1200": "Backtest — NDAQ delta-condor 08:30–12:00",
+    "ndaq_delta_condor_0600_1000": "Backtest — NDAQ delta-condor 06:00–10:00",
 }
-_SOURCE_LABELS = {
-    data_loader.DATA_SOURCE_NAME: "Live dumps (dashboard_new/dumps/)",
-    backtest_source.DATA_SOURCE_NAME: "Backtest — spxw_gamma_hedge_false",
-}
+_SOURCE_LABELS = {data_loader.DATA_SOURCE_NAME: "Live dumps (dashboard_new/dumps/)"}
+_SOURCE_LABELS.update({
+    name: _BACKTEST_LABELS.get(name, f"Backtest — {name}") for name in _SOURCES if name != data_loader.DATA_SOURCE_NAME
+})
 
 st.set_page_config(page_title="Summary — HARCJ Research", layout="wide")
 st.title("Summary")
@@ -88,8 +96,8 @@ with st.sidebar:
     profile = st.selectbox("Profile", loader.available_profiles(), index=0)
     df = loader.load_joined(profile)
     st.caption(f"Usable days: {len(df)} ({df.index.min().date()} → {df.index.max().date()})")
-    if source == backtest_source.DATA_SOURCE_NAME:
-        _sess_start, _sess_end = backtest_source.derive_session_window()
+    if isinstance(loader, backtest_source.BacktestSource):
+        _sess_start, _sess_end = loader.derive_session_window()
         st.caption(
             f"Session window auto-derived from blotter majority vote: "
             f"{_sess_start}–{_sess_end} CT. Open-IV window defaults to the hour "
@@ -98,7 +106,7 @@ with st.sidebar:
 
     st.subheader("BPV settings")
     lookback_raw = st.text_input("BPV lookback grid (trading days, comma-separated)",
-                                  value="20,40,60,90,120,180,252")
+                                  value="60,90,120,180")
     bucket_raw   = st.text_input("BPV bucket-count grid (comma-separated)", value="4,5,8,10")
     lookbacks = _parse_int_list(lookback_raw)
     buckets   = _parse_int_list(bucket_raw)
@@ -128,8 +136,8 @@ with st.sidebar:
 
     st.divider()
     st.subheader("IV settings")
-    if source == backtest_source.DATA_SOURCE_NAME:
-        _sess_start, _ = backtest_source.derive_session_window()
+    if isinstance(loader, backtest_source.BacktestSource):
+        _sess_start, _ = loader.derive_session_window()
         _default_iv_end = _sess_start
         _default_iv_start = (
             pd.Timestamp(_sess_start) - pd.Timedelta(hours=backtest_source.DEFAULT_IV_WINDOW_HOURS_BEFORE_START)
@@ -162,7 +170,7 @@ with st.sidebar:
             iv_end_time = st.text_input("Window end (HH:MM)", value=_default_iv_end)
 
     iv_lookback_raw = st.text_input("IV lookback grid (trading days, comma-separated)",
-                                     value="20,40,60,90,120,180,252")
+                                     value="60,90,120,180")
     iv_bucket_raw   = st.text_input("IV bucket-count grid (comma-separated)", value="4,5,8,10")
     iv_lookbacks = _parse_int_list(iv_lookback_raw)
     iv_buckets   = _parse_int_list(iv_bucket_raw)
@@ -215,37 +223,45 @@ cfg = loader.load_static_config(profile)
 weights = {"pbo": weight_pbo, "avg_daily_pnl": weight_avg_pnl,
            "sortino": weight_sortino, "max_daily_loss": weight_mdl}
 
+canonical_mode = _LIVE_MODE_MAP.get(cfg["flag_combine_method"], "harcj_only")
 
-# ── Compute all 4 modes' grids + composite tables ───────────────────────────────
+
+# ── Compute all 4 modes' grids, PBO vs. the ONE live-equivalent baseline ────────
 # Each cached_* call below is individually cached (grid_cache.py) and already
 # carries its own spinner text — deliberately NOT wrapped in one outer cached
 # function (that would hide all 8 grid/PBO computations behind a single
 # opaque, silent call). Instead a visible status block updates step by step,
 # so a slow run (PBO especially) shows *which* of the 4 modes it's on rather
 # than going blank for however long the whole thing takes.
+#
+# Every mode's PBO here is measured against `canonical_mode`'s static
+# baseline (cached_*_pbo_grid_vs_mode, not each mode's own cached_pbo_grid) —
+# that's what makes pooling all 4 modes into one global ranking below
+# apples-to-apples: every cell, whichever mode it came from, is racing the
+# SAME opponent (the profile's actual live-configured combination).
 
-composite_tables = {}
-with st.status("Computing all 4 mode leaderboards…", expanded=True) as status:
+mode_grids = {}
+with st.status("Computing all 4 modes vs. the live baseline…", expanded=True) as status:
     st.write("HARCJ only — grid…")
     grid = cached_grid(source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
                         int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket))
-    st.write("HARCJ only — PBO grid (this is usually the slow part)…")
-    pbo = cached_pbo_grid(source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
-                           int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket),
-                           cscv_metric, int(cscv_max_S), int(cscv_min_partition))
-    composite_tables["harcj_only"] = dt.composite_score_table(grid, pbo, weights)
+    st.write("HARCJ only — PBO grid vs. live baseline (this is usually the slow part)…")
+    pbo = cached_pbo_grid_vs_mode(source, profile, tuple(lookbacks), tuple(buckets), method, exclusion_rule,
+                                   int(n_exclude), cfg["iv_cutoff"], "harcj_only", int(min_days_per_bucket),
+                                   canonical_mode, cscv_metric, int(cscv_max_S), int(cscv_min_partition))
+    mode_grids["harcj_only"] = (grid, pbo)
     st.write("✓ HARCJ only done (1/4)")
 
     st.write("IV only — grid…")
     grid = cached_iv_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
                            tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
                            int(iv_n_exclude), int(min_days_per_bucket))
-    st.write("IV only — PBO grid…")
-    pbo = cached_iv_pbo_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
-                              tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
-                              int(iv_n_exclude), int(min_days_per_bucket),
-                              cscv_metric, int(cscv_max_S), int(cscv_min_partition))
-    composite_tables["iv_only"] = dt.composite_score_table(grid, pbo, weights)
+    st.write("IV only — PBO grid vs. live baseline…")
+    pbo = cached_iv_pbo_grid_vs_mode(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+                                      tuple(iv_lookbacks), tuple(iv_buckets), iv_method, iv_exclusion_rule,
+                                      int(iv_n_exclude), int(min_days_per_bucket),
+                                      canonical_mode, cscv_metric, int(cscv_max_S), int(cscv_min_partition))
+    mode_grids["iv_only"] = (grid, pbo)
     st.write("✓ IV only done (2/4)")
 
     for i, mode in enumerate(("and_both", "or_either"), start=3):
@@ -255,28 +271,35 @@ with st.status("Computing all 4 mode leaderboards…", expanded=True) as status:
                                    method, exclusion_rule, int(n_exclude),
                                    iv_method, iv_exclusion_rule, int(iv_n_exclude),
                                    mode, int(min_days_per_bucket))
-        st.write(f"{MODE_LABELS[mode]} — paired PBO grid…")
-        pbo = cached_paired_pbo_grid(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
-                                      tuple(lookbacks), tuple(buckets),
-                                      method, exclusion_rule, int(n_exclude),
-                                      iv_method, iv_exclusion_rule, int(iv_n_exclude),
-                                      mode, int(min_days_per_bucket),
-                                      cscv_metric, int(cscv_max_S), int(cscv_min_partition))
-        composite_tables[mode] = dt.composite_score_table(grid, pbo, weights)
+        st.write(f"{MODE_LABELS[mode]} — paired PBO grid vs. live baseline…")
+        pbo = cached_paired_pbo_grid_vs_mode(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+                                              tuple(lookbacks), tuple(buckets),
+                                              method, exclusion_rule, int(n_exclude),
+                                              iv_method, iv_exclusion_rule, int(iv_n_exclude),
+                                              mode, int(min_days_per_bucket),
+                                              canonical_mode, cscv_metric, int(cscv_max_S), int(cscv_min_partition))
+        mode_grids[mode] = (grid, pbo)
         st.write(f"✓ {MODE_LABELS[mode]} done ({i}/4)")
 
-    status.update(label="All 4 mode leaderboards computed", state="complete", expanded=False)
+    status.update(label="All 4 modes computed vs. the live baseline", state="complete", expanded=False)
 
-# ── 4 separate leaderboards ──────────────────────────────────────────────────
+# ── Global ranking — every mode, one leaderboard ────────────────────────────────
 
-st.header("Leaderboards")
-for mode in ("harcj_only", "iv_only", "and_both", "or_either"):
-    st.subheader(MODE_LABELS[mode])
-    table = composite_tables[mode]
-    if table.empty:
-        st.info("No cells have data for all four metrics — nothing to rank.")
-        continue
-    display = table.head(int(top_n)).copy()
+st.header("Global ranking")
+st.caption(
+    f"Every (lookback, n_buckets) cell from all 4 modes, ranked together in one "
+    f"leaderboard. PBO for every cell — whichever mode it's from — is measured "
+    f"against the SAME baseline: this profile's actual live-configured combination "
+    f"(`flag_combine_method={cfg['flag_combine_method']}` → {MODE_LABELS[canonical_mode]}), "
+    "so the ranking is apples-to-apples across modes, not four separate populations."
+)
+
+global_table = dt.global_composite_score_table(mode_grids, weights)
+if global_table.empty:
+    st.info("No cells have data for all four metrics — nothing to rank.")
+else:
+    display = global_table.head(int(top_n)).copy()
+    display["mode"]           = display["mode"].map(lambda m: MODE_LABELS[m])
     display["avg_daily_pnl"]  = display["avg_daily_pnl"].map(lambda v: f"{v:,.0f}")
     display["sortino"]        = display["sortino"].map(lambda v: f"{v:.2f}")
     display["max_daily_loss"] = display["max_daily_loss"].map(lambda v: f"{v:,.0f}")
@@ -285,11 +308,15 @@ for mode in ("harcj_only", "iv_only", "and_both", "or_either"):
     for c in ["rank_avg_daily_pnl", "rank_sortino", "rank_max_daily_loss", "rank_pbo"]:
         display[c] = display[c].map(lambda v: f"{v:.1f}")
     st.dataframe(
-        display[["lookback", "n_buckets", "composite", "avg_daily_pnl", "sortino",
+        display[["mode", "lookback", "n_buckets", "composite", "avg_daily_pnl", "sortino",
                  "max_daily_loss", "pbo", "rank_avg_daily_pnl", "rank_sortino",
                  "rank_max_daily_loss", "rank_pbo", "reliable"]],
         use_container_width=True, hide_index=True,
     )
+    with st.expander("Full global ranking"):
+        full_display = global_table.copy()
+        full_display["mode"] = full_display["mode"].map(lambda m: MODE_LABELS[m])
+        st.dataframe(full_display, use_container_width=True, hide_index=True)
 
 st.divider()
 
@@ -297,7 +324,6 @@ st.divider()
 
 st.header("Compare variants across all modes")
 
-canonical_mode = _LIVE_MODE_MAP.get(cfg["flag_combine_method"], "harcj_only")
 always, static, _ = cached_baselines(source, profile, canonical_mode)
 st.caption(
     f"Reference lines use the live-configured combination mode for this profile "

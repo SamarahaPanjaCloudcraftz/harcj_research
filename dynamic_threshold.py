@@ -663,6 +663,29 @@ def run_pbo_grid(
 _RANK_ASCENDING = {"avg_daily_pnl": False, "sortino": False, "max_daily_loss": False, "pbo": True}
 
 
+def _rank_and_weight(table: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    """
+    Shared ranking tail for composite_score_table/global_composite_score_table
+    (and any other per-cell metrics table with avg_daily_pnl/sortino/
+    max_daily_loss/pbo columns): rank each metric (rank 1 = best, per
+    _RANK_ASCENDING's direction), weighted-average the ranks into "composite"
+    (weights normalized to sum to 1), sort ascending (best first). Empty
+    table passes through unchanged.
+    """
+    if table.empty:
+        return table
+
+    for m, ascending in _RANK_ASCENDING.items():
+        table[f"rank_{m}"] = table[m].rank(ascending=ascending, method="average")
+
+    w_sum = sum(weights.get(m, 0.0) for m in _RANK_ASCENDING) or 1.0
+    table["composite"] = sum(
+        (weights.get(m, 0.0) / w_sum) * table[f"rank_{m}"] for m in _RANK_ASCENDING
+    )
+
+    return table.sort_values("composite", ascending=True).reset_index(drop=True)
+
+
 def composite_score_table(
     grid_result: dict,
     pbo_grid_result: dict,
@@ -711,18 +734,49 @@ def composite_score_table(
             })
 
     table = pd.DataFrame(rows).dropna(subset=["avg_daily_pnl", "sortino", "max_daily_loss", "pbo"])
-    if table.empty:
-        return table
+    return _rank_and_weight(table, weights)
 
-    for m, ascending in _RANK_ASCENDING.items():
-        table[f"rank_{m}"] = table[m].rank(ascending=ascending, method="average")
 
-    w_sum = sum(weights.get(m, 0.0) for m in _RANK_ASCENDING) or 1.0
-    table["composite"] = sum(
-        (weights.get(m, 0.0) / w_sum) * table[f"rank_{m}"] for m in _RANK_ASCENDING
-    )
+def global_composite_score_table(
+    mode_grids: dict[str, tuple[dict, dict]],
+    weights: dict,
+) -> pd.DataFrame:
+    """
+    Same ranking mechanism as composite_score_table, but pools cells from
+    EVERY mode into one table before ranking — a single global leaderboard
+    across harcj_only/iv_only/and_both/or_either, instead of one leaderboard
+    per mode. Adds a "mode" column.
 
-    return table.sort_values("composite", ascending=True).reset_index(drop=True)
+    mode_grids: {mode_name: (grid_result, pbo_grid_result)}. For the ranking
+    to be apples-to-apples across modes, every mode's pbo_grid_result must
+    already be measured against the SAME baseline (e.g. all computed vs. the
+    one live-equivalent static threshold, not each mode's own) — that's the
+    caller's responsibility, not enforced here.
+    """
+    all_rows = []
+    for mode, (grid_result, pbo_grid_result) in mode_grids.items():
+        pnl_df = grid_result["metrics"]["avg_daily_pnl"]
+        srt_df = grid_result["metrics"]["sortino"]
+        mdl_df = grid_result["metrics"]["max_daily_loss"]
+        pbo_df = pbo_grid_result["metrics"]["pbo"]
+        rel_grid = grid_result["reliable"]
+        rel_pbo  = pbo_grid_result["reliable"]
+
+        for B in pnl_df.index:
+            for L in pnl_df.columns:
+                all_rows.append({
+                    "mode":           mode,
+                    "lookback":       L,
+                    "n_buckets":      B,
+                    "avg_daily_pnl":  pnl_df.loc[B, L],
+                    "sortino":        srt_df.loc[B, L],
+                    "max_daily_loss": mdl_df.loc[B, L],
+                    "pbo":            pbo_df.loc[B, L],
+                    "reliable":       bool(rel_grid.loc[B, L]) and bool(rel_pbo.loc[B, L]),
+                })
+
+    table = pd.DataFrame(all_rows).dropna(subset=["avg_daily_pnl", "sortino", "max_daily_loss", "pbo"])
+    return _rank_and_weight(table, weights)
 
 
 # ── Paired grid (and_both / or_either) ──────────────────────────────────────────

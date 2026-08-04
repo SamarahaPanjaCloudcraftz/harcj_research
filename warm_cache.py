@@ -24,7 +24,7 @@ import grid_cache as gc
 # ── Exact sidebar defaults (must match pages/2_threshold_grid.py and
 #    pages/3_summary.py — see their st.text_input/st.radio default values) ──
 
-LOOKBACKS = (20, 40, 60, 90, 120, 180, 252)
+LOOKBACKS = (60, 90, 120, 180)
 BUCKETS   = (4, 5, 8, 10)
 METHOD    = "equal_count"          # first option in the bucketing-method radio
 RULE      = "highest_vol"          # first option, now the default (per user request)
@@ -43,18 +43,19 @@ CSCV_MIN_PARTITION = 4
 
 _LIVE_MODE_MAP = {"ignore_harcj": "iv_only", "or": "and_both", "and": "or_either"}
 
+_LOADERS = {data_loader.DATA_SOURCE_NAME: data_loader}
+_LOADERS.update({src.DATA_SOURCE_NAME: src for src in backtest_source.ALL_SOURCES})
+
 # Per-source IV defaults (must match the sidebar's per-source default logic
-# in both pages): live_dumps has a fixed 07:30-08:30 dump window, the
+# in both pages): live_dumps has a fixed 07:30-08:30 dump window, every
 # backtest source derives its own session and defaults to the hour before it.
-_IV_SOURCE_MODE = {
-    data_loader.DATA_SOURCE_NAME: "mean",       # first option in the IV-source radio
-    backtest_source.DATA_SOURCE_NAME: "mean",
-}
+_IV_SOURCE_MODE = {name: "mean" for name in _LOADERS}       # first option in the IV-source radio
 
 
 def _iv_mean_window(source: str) -> tuple[str, str]:
-    if source == backtest_source.DATA_SOURCE_NAME:
-        start, _end = backtest_source.derive_session_window()
+    loader = _LOADERS[source]
+    if isinstance(loader, backtest_source.BacktestSource):
+        start, _end = loader.derive_session_window()
         window_start = (
             pd.Timestamp(start) - pd.Timedelta(hours=backtest_source.DEFAULT_IV_WINDOW_HOURS_BEFORE_START)
         ).strftime("%H:%M")
@@ -69,7 +70,7 @@ def _timed(label, fn):
 
 
 def _warm_profile(source: str, profile: str):
-    loader = data_loader if source == data_loader.DATA_SOURCE_NAME else backtest_source
+    loader = _LOADERS[source]
     cfg = loader.load_static_config(profile)
     iv_source_mode = _IV_SOURCE_MODE[source]
     iv_timestamp = None
@@ -89,12 +90,21 @@ def _warm_profile(source: str, profile: str):
         cfg["iv_cutoff"], "harcj_only", MIN_DAYS_PER_BUCKET,
         CSCV_METRIC, CSCV_MAX_S, CSCV_MIN_PARTITION,
     ))
-    _timed("default cell L=20,B=4", lambda: gc.cached_cell(
+    _timed(f"default cell L={LOOKBACKS[0]},B={BUCKETS[0]}", lambda: gc.cached_cell(
         source, profile, LOOKBACKS[0], BUCKETS[0], METHOD, RULE, N_EXCLUDE,
         cfg["iv_cutoff"], "harcj_only", MIN_DAYS_PER_BUCKET,
     ))
 
-    # ── Summary page default view: all 4 modes ──────────────────────────────
+    canonical_mode = _LIVE_MODE_MAP.get(cfg["flag_combine_method"], "harcj_only")
+
+    # ── Summary page default view: all 4 modes, PBO vs. the ONE live baseline ──
+    print("Summary — harcj_only (PBO vs. live baseline):")
+    _timed("pbo_grid_vs_mode", lambda: gc.cached_pbo_grid_vs_mode(
+        source, profile, LOOKBACKS, BUCKETS, METHOD, RULE, N_EXCLUDE,
+        cfg["iv_cutoff"], "harcj_only", MIN_DAYS_PER_BUCKET,
+        canonical_mode, CSCV_METRIC, CSCV_MAX_S, CSCV_MIN_PARTITION,
+    ))
+
     print("Summary — iv_only:")
     _timed("baselines", lambda: gc.cached_iv_baselines(
         source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
@@ -103,12 +113,12 @@ def _warm_profile(source: str, profile: str):
         source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
         IV_LOOKBACKS, IV_BUCKETS, IV_METHOD, IV_RULE, IV_N_EXCLUDE, MIN_DAYS_PER_BUCKET,
     ))
-    _timed("pbo_grid", lambda: gc.cached_iv_pbo_grid(
+    _timed("pbo_grid_vs_mode", lambda: gc.cached_iv_pbo_grid_vs_mode(
         source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
         IV_LOOKBACKS, IV_BUCKETS, IV_METHOD, IV_RULE, IV_N_EXCLUDE, MIN_DAYS_PER_BUCKET,
-        CSCV_METRIC, CSCV_MAX_S, CSCV_MIN_PARTITION,
+        canonical_mode, CSCV_METRIC, CSCV_MAX_S, CSCV_MIN_PARTITION,
     ))
-    _timed("default cell L=20,B=4", lambda: gc.cached_iv_cell(
+    _timed(f"default cell L={LOOKBACKS[0]},B={BUCKETS[0]}", lambda: gc.cached_iv_cell(
         source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
         IV_LOOKBACKS[0], IV_BUCKETS[0], IV_METHOD, IV_RULE, IV_N_EXCLUDE, MIN_DAYS_PER_BUCKET,
     ))
@@ -123,19 +133,18 @@ def _warm_profile(source: str, profile: str):
             LOOKBACKS, BUCKETS, METHOD, RULE, N_EXCLUDE, IV_METHOD, IV_RULE, IV_N_EXCLUDE,
             mode, MIN_DAYS_PER_BUCKET,
         ))
-        _timed("paired pbo_grid", lambda: gc.cached_paired_pbo_grid(
+        _timed("paired pbo_grid_vs_mode", lambda: gc.cached_paired_pbo_grid_vs_mode(
             source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             LOOKBACKS, BUCKETS, METHOD, RULE, N_EXCLUDE, IV_METHOD, IV_RULE, IV_N_EXCLUDE,
-            mode, MIN_DAYS_PER_BUCKET, CSCV_METRIC, CSCV_MAX_S, CSCV_MIN_PARTITION,
+            mode, MIN_DAYS_PER_BUCKET, canonical_mode, CSCV_METRIC, CSCV_MAX_S, CSCV_MIN_PARTITION,
         ))
-        _timed("default paired cell L=20,B=4", lambda: gc.cached_paired_cell(
+        _timed(f"default paired cell L={LOOKBACKS[0]},B={BUCKETS[0]}", lambda: gc.cached_paired_cell(
             source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
             LOOKBACKS[0], BUCKETS[0], LOOKBACKS[0], BUCKETS[0],
             METHOD, RULE, N_EXCLUDE, IV_METHOD, IV_RULE, IV_N_EXCLUDE,
             mode, MIN_DAYS_PER_BUCKET,
         ))
 
-    canonical_mode = _LIVE_MODE_MAP.get(cfg["flag_combine_method"], "harcj_only")
     print(f"Summary — canonical-mode baselines ({canonical_mode}, for reference lines):")
     if canonical_mode == "harcj_only":
         _timed("baselines", lambda: gc.cached_baselines(source, profile, canonical_mode))
@@ -150,8 +159,7 @@ def _warm_profile(source: str, profile: str):
 
 
 def main():
-    for source, loader in ((data_loader.DATA_SOURCE_NAME, data_loader),
-                            (backtest_source.DATA_SOURCE_NAME, backtest_source)):
+    for source, loader in _LOADERS.items():
         for profile in loader.available_profiles():
             _warm_profile(source, profile)
             print()

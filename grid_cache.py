@@ -12,11 +12,11 @@ Two cache layers stack here:
      any DIFFERENT combination just computes fresh (and is then saved for
      its own next time) — nothing here hard-codes "defaults" specially.
 
-Every function here takes a `source` argument (data_loader.DATA_SOURCE_NAME
-or backtest_source.DATA_SOURCE_NAME) selecting which loader module to read
-from — it's part of the cache key so the two sources never collide, on
-disk or in st.cache_data. Otherwise: just loads data + calls into
-dynamic_threshold.py; no rendering, no widgets.
+Every function here takes a `source` argument (a DATA_SOURCE_NAME string)
+selecting which loader (module or BacktestSource instance) to read from —
+it's part of the cache key so sources never collide, on disk or in
+st.cache_data. Otherwise: just loads data + calls into dynamic_threshold.py;
+no rendering, no widgets.
 """
 
 from __future__ import annotations
@@ -28,10 +28,8 @@ import backtest_source
 import dynamic_threshold as dt
 from disk_cache import load_or_compute
 
-_LOADERS = {
-    data_loader.DATA_SOURCE_NAME: data_loader,
-    backtest_source.DATA_SOURCE_NAME: backtest_source,
-}
+_LOADERS = {data_loader.DATA_SOURCE_NAME: data_loader}
+_LOADERS.update({src.DATA_SOURCE_NAME: src for src in backtest_source.ALL_SOURCES})
 
 
 def _loader(source: str):
@@ -297,3 +295,79 @@ def cached_paired_baselines(source, profile, iv_source_mode, iv_timestamp, iv_st
         static = dt.static_threshold_baseline(df, cfg["exclusion_ranges"], cfg["iv_cutoff"], iv_mode=iv_mode)
         return always, static
     return load_or_compute("cached_paired_baselines", args, _compute, profile=profile, source=source)
+
+
+# ── PBO vs. a FIXED baseline mode (Summary page's global cross-mode ranking) ────
+# Unlike cached_pbo_grid/cached_iv_pbo_grid/cached_paired_pbo_grid (each cell
+# measured against ITS OWN mode's static baseline), these measure every
+# cell — regardless of which mode's grid it comes from — against ONE shared
+# baseline (`baseline_mode`, typically the profile's actual live-configured
+# combination). That's what makes a single ranking pooling all 4 modes
+# together apples-to-apples: everything is racing the same opponent.
+
+@st.cache_data(show_spinner="Running walk-forward grid — PBO vs. live baseline…")
+def cached_pbo_grid_vs_mode(source, profile, lookbacks, buckets, method, exclusion_rule, n_exclude,
+                             iv_cutoff, iv_mode, min_days_per_bucket, baseline_mode,
+                             cscv_metric, max_S, min_partition_size):
+    args = (profile, lookbacks, buckets, method, exclusion_rule, n_exclude,
+            iv_cutoff, iv_mode, min_days_per_bucket, baseline_mode, cscv_metric, max_S, min_partition_size)
+
+    def _compute():
+        df = _loader(source).load_joined(profile)
+        _, baseline_static, _ = cached_baselines(source, profile, baseline_mode)
+        return dt.run_pbo_grid(
+            df, list(lookbacks), list(buckets), static_daily_pnl=baseline_static["_daily_pnl"],
+            method=method, exclusion_rule=exclusion_rule, n_exclude=n_exclude,
+            iv_cutoff=iv_cutoff, iv_mode=iv_mode, min_days_per_bucket=min_days_per_bucket,
+            cscv_metric=cscv_metric, max_S=max_S, min_partition_size=min_partition_size,
+            extra_history=_extra_history(source, profile),
+        )
+    return load_or_compute("cached_pbo_grid_vs_mode", args, _compute, profile=profile, source=source)
+
+
+@st.cache_data(show_spinner="Running IV walk-forward grid — PBO vs. live baseline…")
+def cached_iv_pbo_grid_vs_mode(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+                                lookbacks, buckets, method, exclusion_rule, n_exclude, min_days_per_bucket,
+                                baseline_mode, cscv_metric, max_S, min_partition_size):
+    args = (profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            lookbacks, buckets, method, exclusion_rule, n_exclude, min_days_per_bucket,
+            baseline_mode, cscv_metric, max_S, min_partition_size)
+
+    def _compute():
+        df = _loader(source).load_joined_with_iv(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time)
+        _, baseline_static, _ = cached_baselines(source, profile, baseline_mode)
+        return dt.run_pbo_grid(
+            df, list(lookbacks), list(buckets), static_daily_pnl=baseline_static["_daily_pnl"],
+            method=method, exclusion_rule=exclusion_rule, n_exclude=n_exclude,
+            value_col="iv_dynamic", iv_mode="harcj_only", min_days_per_bucket=min_days_per_bucket,
+            cscv_metric=cscv_metric, max_S=max_S, min_partition_size=min_partition_size,
+            extra_history=_iv_extra_history(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time),
+        )
+    return load_or_compute("cached_iv_pbo_grid_vs_mode", args, _compute, profile=profile, source=source)
+
+
+@st.cache_data(show_spinner="Running paired walk-forward grid — PBO vs. live baseline…")
+def cached_paired_pbo_grid_vs_mode(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+                                    lookbacks, buckets,
+                                    harcj_method, harcj_exclusion_rule, harcj_n_exclude,
+                                    iv_method, iv_exclusion_rule, iv_n_exclude,
+                                    iv_mode, min_days_per_bucket, baseline_mode,
+                                    cscv_metric, max_S, min_partition_size):
+    args = (profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time,
+            lookbacks, buckets, harcj_method, harcj_exclusion_rule, harcj_n_exclude,
+            iv_method, iv_exclusion_rule, iv_n_exclude, iv_mode, min_days_per_bucket,
+            baseline_mode, cscv_metric, max_S, min_partition_size)
+
+    def _compute():
+        df = _loader(source).load_joined_with_iv(profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time)
+        _, baseline_static, _ = cached_baselines(source, profile, baseline_mode)
+        return dt.run_paired_pbo_grid(
+            df, list(lookbacks), list(buckets), static_daily_pnl=baseline_static["_daily_pnl"],
+            harcj_method=harcj_method, harcj_exclusion_rule=harcj_exclusion_rule, harcj_n_exclude=harcj_n_exclude,
+            iv_method=iv_method, iv_exclusion_rule=iv_exclusion_rule, iv_n_exclude=iv_n_exclude,
+            iv_mode=iv_mode, min_days_per_bucket=min_days_per_bucket,
+            cscv_metric=cscv_metric, max_S=max_S, min_partition_size=min_partition_size,
+            harcj_extra_history=_extra_history(source, profile),
+            iv_extra_history=_iv_extra_history(source, profile, iv_source_mode, iv_timestamp, iv_start_time, iv_end_time),
+        )
+    return load_or_compute("cached_paired_pbo_grid_vs_mode", args, _compute, profile=profile, source=source)
